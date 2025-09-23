@@ -27,7 +27,7 @@ def upsert_atom(dst_res, src_atom):
             return
     dst_res.add_atom(copy.deepcopy(src_atom))
 
-def stitch_one(full_path, crop_path, out_path):
+def stitch(full_path: str, crop_path: str, out_path: str):
     full = gemmi.read_structure(full_path)
     crop = gemmi.read_structure(crop_path)
 
@@ -67,7 +67,6 @@ def stitch_one(full_path, crop_path, out_path):
                     for a in r:
                         dst_r.add_atom(copy.deepcopy(a))
 
-
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     full.write_minimal_pdb(out_path)
 
@@ -81,12 +80,11 @@ def main():
     full_pdb = args.full_pdb
     split_dir = args.split_dir
     out_dir = args.out_dir
-    os.makedirs(out_dir, exist_ok=True)
     crops = sorted(glob.glob(os.path.join(split_dir, "*.pdb")))
     for crop in crops:
         base = os.path.splitext(os.path.basename(crop))[0]
         out_path = os.path.join(out_dir, f"recovered_{base}.pdb")
-        stitch_one(full_pdb, crop, out_path)
+        stitch(full_pdb, crop, out_path)
     print(f"Recovered backbone for {len(crops)} structures... Saved at {out_dir}")
 
 if __name__ == "__main__":
