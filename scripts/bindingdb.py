@@ -590,6 +590,8 @@ agg_dict = {
     "is_reference": ("is_reference","first"),
     "key_mutations": ("key_mutations","first"),
     "n_subs": ("n_subs","first"),
+    "n_ins": ("n_ins","first"),
+    "n_del": ("n_del","first"),
     "pdb_ids": ("PDB ID(s) of Target Chain", uniq_join),
 }
 for c in aff_cols:
@@ -606,7 +608,8 @@ grouped = grouped.sort_values(
     ["Protein Key","Sequence MD5","Ligand Key","is_reference"],
     ascending=[True,True,True,False]
 )
-selected_grouped = grouped.drop(columns=group_cols[1:-1])
+selected_grouped = grouped.drop(columns=['n_ins', 'n_del'])
+selected_grouped = selected_grouped.drop(columns=group_cols[1:-1])
 selected_grouped = selected_grouped[
     selected_grouped['pdb_ids'].notna() &
     selected_grouped['pdb_ids'].astype(str).str.strip().ne("")
@@ -616,6 +619,7 @@ selected_grouped.to_csv(substitution_final_path, index=False)
 print(f"Grouped available substitutions only (final): {substitution_final_path}")
 # %% Per-protein stats
 g = grouped.copy()
+g = g.drop(columns=['n_ins', 'n_del'])
 
 required = ["Protein Key", "Sequence MD5", "Ligand Key", "is_reference", "n_subs"]
 missing = [c for c in required if c not in g.columns]
@@ -661,7 +665,7 @@ stats = stats.reset_index()
 out_stats = DATA_DIR / "09_stats.csv"
 stats.to_csv(out_stats, index=False)
 print(f"Stats: {out_stats}")
-# %%
+# %% Find mutation info
 g = grouped.copy()
 
 def pick_col(df, cands, default=None):
@@ -670,9 +674,10 @@ def pick_col(df, cands, default=None):
             return c
     return default
 
-mut_cols = [c for c in ["n_subs","n_ins","n_del"] if c in g.columns]
-g["has_mut"] = g[mut_cols].fillna(0).sum(axis=1) > 0
+g["has_mut"] = g["n_subs"].fillna(0) > 0
 g = g[g["n_subs"].fillna(0) < 30]
+g = g[g["n_ins"].fillna(0) == 0]
+g = g[g["n_del"].fillna(0) == 0]
 
 grp = (
     g.groupby(["Protein Key","Ligand Key"], dropna=False)
@@ -692,16 +697,16 @@ out = out.sort_values(
 cols = [
     "Protein Key",
     pick_col(out, ["target_name","Target Name","Target Name (norm)"]),
-    "Ligand Key",
-    pick_col(out, ["ligand_name","Binding DB Ligand Name"]),
-    pick_col(out, ["smiles","Ligand SMILES"]),
-    "Sequence MD5",
+    # "Ligand Key",
+    pick_col(out, ["ligand", "ligand_name","Binding DB Ligand Name"]),
+    pick_col(out, ["ligand_smiles", "smiles","Ligand SMILES"]),
+    # "Sequence MD5",
     pick_col(out, ["example_seq","Sequence (clean)"]),
     "is_reference",
     pick_col(out, ["key_mutations","diffs_vs_reference"]),
     "n_subs",
-    pick_col(out, ["n_ins"], default=None),
-    pick_col(out, ["n_del"], default=None),
+    # pick_col(out, ["n_ins"], default=None),
+    # pick_col(out, ["n_del"], default=None),
     pick_col(out, ["Ki (nM)"], default=None),
     pick_col(out, ["IC50 (nM)"], default=None),
     pick_col(out, ["Kd (nM)"], default=None),
