@@ -21,11 +21,31 @@ def com_pdb_block(lines):
     a=np.array(pts); m=a.mean(axis=0); return (float(m[0]),float(m[1]),float(m[2]))
 
 def rdkit_from_mol2(path):
-    m=Chem.MolFromMol2File(path,removeHs=False,sanitize=False)
+    m=Chem.MolFromMol2File(path, removeHs=False, sanitize=False)
     if m is None or m.GetNumAtoms()==0: 
         m=Chem.MolFromMol2File(path,removeHs=False)
     if m is None or m.GetNumAtoms()==0: 
         raise SystemExit("failed to read mol2")
+    if m.GetNumConformers()==0:
+        m=Chem.AddHs(m,addCoords=True)
+        AllChem.EmbedMolecule(m,AllChem.ETKDGv3())
+    else:
+        try: 
+            m=Chem.AddHs(m,addCoords=True)
+        except: 
+            pass
+    return m
+
+def rdkit_from_sdf(path):
+    suppl=Chem.SDMolSupplier(path, removeHs=False, sanitize=False)
+    cands = [m for m in suppl if m is not None and m.GetNumAtoms() > 0]
+    if not cands:
+        raise SystemExit(f"failed to read sdf: {path}")
+    m = max(cands, key=lambda x: x.GetNumHeavyAtoms())
+    if m is None or m.GetNumAtoms()==0: 
+        m=Chem.MolFromSdfFile(path,removeHs=False)
+    if m is None or m.GetNumAtoms()==0: 
+        raise SystemExit("failed to read sdf")
     if m.GetNumConformers()==0:
         m=Chem.AddHs(m,addCoords=True)
         AllChem.EmbedMolecule(m,AllChem.ETKDGv3())
@@ -78,7 +98,13 @@ def main():
     if not old_block: raise SystemExit("old ligand not found")
     com_old=com_pdb_block(old_block)
 
-    m=rdkit_from_mol2(args.new_ligand)
+    ligand_ext = os.path.splitext(args.new_ligand)[1]
+    if ligand_ext == '.mol2':
+        m=rdkit_from_mol2(args.new_ligand)
+    elif ligand_ext == '.sdf':
+        m=rdkit_from_sdf(args.new_ligand)
+    # elif ligand_ext == '.cif':
+    #     m=rdkit_from_cif(args.new_ligand)
     het, idx2serial = het_lines_from_rdkit(m, args.out_resname or args.old_resname, args.old_chain, args.old_resid, max_serial+1)
     com_new=com_pdb_block(het)
     dx,dy,dz=com_old[0]-com_new[0], com_old[1]-com_new[1], com_old[2]-com_new[2]
