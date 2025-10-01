@@ -328,6 +328,71 @@ def main(args) -> None:
             out_dict["std_of_probs"] = std_dict
             torch.save(out_dict, output_stats_path)
 
+            # Save out_dict as npy and csv
+            import csv, gzip
+            os.makedirs(args.out_folder, exist_ok=True)
+
+            def _open_out(path):
+                return gzip.open(path, "wt") if path.endswith(".gz") else open(path, "w")
+
+            def save_per_residue_realized_csv(meta, logits, log_probs):
+                alph = {a:i for i,a in enumerate(meta["alphabet"])}
+                seq = meta["sequence"]
+                resn = meta.get("residue_names", {})
+                path = output_sum_path + "_per_residue_scores.csv"
+                with _open_out(path) as f:
+                    w = csv.writer(f)
+                    w.writerow(["idx","residue","aa","logit","log_prob"])
+                    for i,a in enumerate(seq):
+                        j = alph[a]
+                        name = resn.get(str(i), str(i))
+                        w.writerow([i, name, a, float(logits[i,j]), float(log_probs[i,j])])
+
+            def save_matrix_wide_csv(meta, arr, fname):
+                # arr: [L,V] (logits or log_probs)
+                alph = meta["alphabet"]
+                resn = meta.get("residue_names", {})
+                path = output_sum_path + "_" + fname
+                with _open_out(path) as f:
+                    w = csv.writer(f)
+                    w.writerow(["idx","residue"] + list(alph))
+                    L, V = arr.shape
+                    for i in range(L):
+                        name = resn.get(str(i), str(i))
+                        row = [i, name] + [f"{arr[i,j]:.6f}" for j in range(V)]
+                        w.writerow(row)
+
+            def save_topk_json(meta, log_probs, k=5):
+                alph = meta["alphabet"]
+                resn = meta.get("residue_names", {})
+                L, V = log_probs.shape
+                out = []
+                for i in range(L):
+                    idx = np.argsort(log_probs[i])[::-1][:k]
+                    out.append({
+                        "idx": i,
+                        "residue": resn.get(str(i), str(i)),
+                        "topk": [{"aa": alph[j], "log_prob": float(log_probs[i,j])} for j in idx]
+                    })
+                path = output_sum_path + "_topk.json"
+                with open(path, "w") as f:
+                    json.dump(out, f)
+            
+            output_sum_path = base_folder + name + args.file_ending
+            logits = out_dict["logits"][0] # [L, V]
+            log_probs = out_dict["log_probs"][0]
+            meta = {
+                "alphabet": out_dict["alphabet"],
+                "sequence": out_dict["sequence"],
+                "residue_names": out_dict.get("residue_names", {})
+            }
+            output_meta_path = output_sum_path + "_meta.json"
+            with open(output_meta_path, "w") as f:
+                json.dump(meta, f)
+            save_per_residue_realized_csv(meta, logits, log_probs)
+            save_matrix_wide_csv(meta, logits, "logits.csv.gz")
+            save_matrix_wide_csv(meta, log_probs, "log_probs.csv.gz")
+            save_topk_json(meta, log_probs, 5)
 
 
 if __name__ == "__main__":
