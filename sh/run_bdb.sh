@@ -11,7 +11,7 @@ source /apps/.slurmrc
 slurm_start $SLURM_CHANNEL_ID
 ###############################################
 python /home/yunmin/proj/LigandMPNN/scripts/bindingdb_prep.py \
---in /home/yunmin/proj/LigandMPNN/scripts/BindingDB_BindingDB_Articles.tsv \
---out /home/yunmin/proj/LigandMPNN/scripts/12_find_mutation_complex.csv
+--in /home/yunmin/proj/data/db/BindingDB_BindingDB_Articles.tsv \
+--out /home/yunmin/proj/data/db/benchmarking_set.csv
 ###############################################
 slurm_end $SLURM_CHANNEL_ID
