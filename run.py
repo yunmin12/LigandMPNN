@@ -474,6 +474,9 @@ def main(args) -> None:
             output_backbones = base_folder + "/backbones/"
             output_packed = base_folder + "/packed/"
             output_stats_path = base_folder + "stats/" + name + args.file_ending + ".pt"
+            output_stats_json = base_folder + "stats/" + name + args.file_ending + ".json"
+            output_stats_csv = base_folder + "stats/" + name + args.file_ending + ".csv"
+
 
             out_dict = {}
             out_dict["generated_sequences"] = S_stack.cpu()
@@ -487,7 +490,58 @@ def main(args) -> None:
             out_dict["temperature"] = args.temperature
             if args.save_stats:
                 torch.save(out_dict, output_stats_path)
+            
+            # Save stats as json and csv
+            def to_serializable(obj):
+                if isinstance(obj, dict):
+                    return {k: to_serializable(v) for k, v in obj.items()}
+                if isinstance(obj, (list, tuple)):
+                    return [to_serializable(x) for x in obj]
+                if hasattr(obj, "item") and callable(getattr(obj, "item", None)) and getattr(obj, "ndim", 1) == 0:
+                    try:
+                        return obj.item()
+                    except Exception:
+                        pass
+                if isinstance(obj, torch.Tensor):
+                    return obj.detach().cpu().tolist()
+                if np is not None:
+                    if isinstance(obj, np.ndarray):
+                        return obj.tolist()
+                if isinstance(obj, set):
+                    return list(obj)
+                return obj
+            serial = to_serializable(out_dict)
 
+            if args.save_stats:
+                try:
+                    with open(output_stats_json, "w", encoding="utf-8") as jf:
+                        json.dump(serial, jf, indent=2, ensure_ascii=False)
+                except Exception as e:
+                    print(f"[Warning] failed to write JSON stats: {e}")
+            
+            import csv
+            def flatten(d, prefix="", acc=None):
+                if acc is None:
+                    acc = {}
+                if isinstance(d, dict):
+                    for k, v in d.items():
+                        flatten(v, f"{prefix}{k}." if prefix else f"{k}.", acc)
+                elif isinstance(d, (list, tuple)):
+                    acc[prefix[:-1]] = json.dumps(d, ensure_ascii=False)
+                else:
+                    acc[prefix[:-1]] = d
+                return acc
+            
+            if args.save_stats:
+                try:
+                    flat = flatten(serial)
+                    with open(output_stats_csv, "w", newline="", encoding="utf-8") as cf:
+                        writer = csv.DictWriter(cf, fieldnames=list(flat.keys()))
+                        writer.writeheader()
+                        writer.writerow(flat)
+                except Exception as e:
+                    print(f"[Warning] failed to write CSV stats: {e}")
+            
             if args.pack_side_chains:
                 if args.verbose:
                     print("Packing side chains...")
@@ -541,7 +595,8 @@ def main(args) -> None:
                     X_stack_list.append(X_stack)
                     X_m_stack_list.append(X_m_stack)
                     b_factor_stack_list.append(b_factor_stack)
-
+                print("Side chain packing is done!")
+                
             with open(output_fasta, "w") as f:
                 f.write(
                     ">{}, T={}, seed={}, num_res={}, num_ligand_res={}, use_ligand_context={}, ligand_cutoff_distance={}, batch_size={}, number_of_batches={}, model_path={}\n{}\n".format(
