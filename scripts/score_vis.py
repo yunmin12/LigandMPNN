@@ -189,6 +189,8 @@ def analyze_pdb(results_dir: Path, pdb_id: str, mut: Mut, out_dir: Path):
     per_pos_records = []
     key_counts = {aa: 0 for aa in AA_LIST}
     total_reps = 0
+    key_logprob_sums = {aa: 0.0 for aa in AA_LIST}
+    key_logprob_ns   = {aa: 0   for aa in AA_LIST}
 
     for rep_id, paths in sorted(reps.items(), key=lambda kv: int(kv[0])):
         try:
@@ -202,6 +204,15 @@ def analyze_pdb(results_dir: Path, pdb_id: str, mut: Mut, out_dir: Path):
         chosen_prob = probs[np.arange(L), argmax_idx]
         chosen_logit = logits[np.arange(L), argmax_idx] if logits is not None else np.full(L, np.nan)
 
+        row = probs[key_ix]
+        for j, aa in enumerate(aa_cols):
+            a = aa.upper()
+            if a in AA_SET:
+                p = float(row[j])
+                lp = np.log(max(p, 1e-12))
+                key_logprob_sums[a] += lp
+                key_logprob_ns[a] += 1
+        
         for i in range(L):
             per_pos_records.append({
                 "pdb_id": pdb_id,
@@ -220,6 +231,10 @@ def analyze_pdb(results_dir: Path, pdb_id: str, mut: Mut, out_dir: Path):
     if total_reps == 0:
         print(f"[WARN] {pdb_id}: no usable replicates")
         return None
+
+    mean_lp = {aa: (key_logprob_sums[aa] / key_logprob_ns[aa] 
+                    if key_logprob_ns[aa] else np.nan)
+                    for aa in AA_LIST}
 
     per_pos_df = pd.DataFrame(per_pos_records)
 
@@ -240,23 +255,71 @@ def analyze_pdb(results_dir: Path, pdb_id: str, mut: Mut, out_dir: Path):
     fig1.savefig(out_dir / f"{pdb_id}_{mut.chain}_per_residue_confidence.png", dpi=180)
     plt.close(fig1)
 
+    half_w = 20
+    lo = max(0, key_ix - half_w)
+    hi = min(L - 1, key_ix + half_w)
+
+    m_crop = m[(m['idx'] >= lo) & (m['idx'] <= hi)].copy()
+    if m_crop.empty:
+        pass
+    else: 
+        fig2_2 = plt.figure(figsize=(10, 3.2))
+        axc = fig2_2.gca()
+        axc.plot(m_crop['idx'], m_crop['chosen_prob'])
+        axc.set_xlabel(f"Residue (PDB numbering)  |  window: ±{half_w}")
+        axc.set_ylabel("Mean chosen prob across reps")
+        axc.set_title(f"{pdb_id} {mut.chain}: per-residue confidence (crop ±{half_w})")
+        axc.axvline(key_ix, linestyle='--')
+
+        tick_idx = np.linspace(lo, hi, num=min(15, max(5, (hi - lo + 1)//2)), dtype=int)
+        axc.set_xticks(tick_idx)
+        axc.set_xticklabels(
+            [m.loc[m['idx']==i, 'pdb_label'].iloc[0] if (m['idx']==i).any() else labels[i]
+                for i in tick_idx],
+            rotation=45, ha='right'
+        )
+        fig2_2.tight_layout()
+        fig2_2.savefig(out_dir / f"{pdb_id}_{mut.chain}_per_residue_confidence_crop{half_w}.png", dpi=180)
+        plt.close(fig2_2)
+
     # 2) Key-site AA count bar (counts/total) per PDBs
     fracs = {aa: key_counts[aa] / float(total_reps) for aa in AA_LIST}
+
+    mean_lp = {
+        aa: (key_logprob_sums[aa] / key_logprob_ns[aa]) if key_logprob_ns[aa] > 0 else np.nan
+        for aa in AA_LIST
+    }
+
     xs = np.arange(len(AA_LIST))
     vals = np.array([fracs[a] for a in AA_LIST])
     fig2 = plt.figure(figsize=(10, 4))
     ax2 = fig2.gca()
     bars = ax2.bar(xs, vals)
+
     if mut.mt in AA_INDEX:
         bars[AA_INDEX[mut.mt]].set_hatch('///')
         bars[AA_INDEX[mut.mt]].set_linewidth(1.5)
+    
     ax2.set_xticks(xs)
     ax2.set_xticklabels(AA_LIST)
     ax2.set_ylim(0, 1)
     ax2.set_ylabel("# of AA / total")
     ax2.set_title(f"{pdb_id}: key-site AA choices @ {mut.chain}{mut.pos} (N={total_reps})")
+    
+    labels = []
+    for idx, rect in enumerate(bars):
+        h = rect.get_height()
+        aa = AA_LIST[idx]
+        if h > 0:
+            lp = mean_lp.get(aa, float("nan"))
+            label = f"{aa}\n{lp:.2f}" if np.isfinite(lp) else f"{aa}\nNA"
+        else:
+            label = ""
+        labels.append(label)
+    ax2.bar_label(bars, labels=labels, label_type='edge', padding=2, fontsize=8)
+
     fig2.tight_layout()
-    mut_id = f"{mut.chain}{mut.pos}_" + (f"{mut.wt}>{mut.mt}" if mut.wt else f"{mut.mt}")
+    mut_id = f"{mut.chain}{mut.pos}_" + (f"{mut.wt}_{mut.mt}" if mut.wt else f"{mut.mt}")
     fig2.savefig(out_dir / f"{pdb_id}_{mut_id}_keysite_aa_counts.png", dpi=180)
     plt.close(fig2)
 
@@ -270,6 +333,7 @@ def analyze_pdb(results_dir: Path, pdb_id: str, mut: Mut, out_dir: Path):
         "count": key_counts[aa],
         "fraction": fracs[aa],
         "total_reps": total_reps,
+        "mean_log_prob": float(mean_lp[aa]) if np.isfinite(mean_lp[aa]) else np.nan,
     } for aa in AA_LIST]
 
     return {
@@ -284,22 +348,29 @@ def plot_key_aa_ratio(key_df: pd.DataFrame, out_dir: str):
 
     for chain, pos in sites:
         df_site = key_df[(key_df['chain'] == chain) & (key_df['pos'] == pos)].copy()
-        df_site = df_site[['pdb_id', 'aa', 'fraction']].groupby(['pdb_id', 'aa'], as_index=False)['fraction'].max()
-        
-        plot_df = (
-            df_site
-            .pivot_table(index='pdb_id', columns='aa', values='fraction', fill_value=0.0, aggfunc='max')
-            .reindex(columns=sorted([c for c in df_site['aa'].unique()]))
-            .sort_index()
-        )
+
+        if 'mean_log_prob' not in df_site.columns:
+            df_site['mean_log_prob'] = np.nan
+
+        agg = (df_site
+               .groupby(['pdb_id', 'aa'], as_index=False)
+               .agg(fraction=('fraction', 'max'),
+                    mean_log_prob=('mean_log_prob', 'mean')))
+
+        aas = sorted(agg['aa'].unique())
+        pdbs = sorted(agg['pdb_id'].unique())
+
+        plot_df = (agg.pivot_table(index='pdb_id', columns='aa', values='fraction',
+                                   fill_value=0.0, aggfunc='max')
+                        .reindex(index=pdbs, columns=aas))
+
+        lp_wide = (agg.pivot_table(index='pdb_id', columns='aa', values='mean_log_prob',
+                                   fill_value=np.nan, aggfunc='mean')
+                        .reindex(index=plot_df.index, columns=plot_df.columns))
 
         site_rows = key_df[(key_df['chain'] == chain) & (key_df['pos'] == pos)]
-        wt_candidates = (
-            site_rows['wt_aa'].dropna().replace('', pd.NA).dropna().unique()
-        )
-        mt_candidates = (
-            site_rows['mut_aa'].dropna().replace('', pd.NA).dropna().unique()
-        )
+        wt_candidates = site_rows['wt_aa'].dropna().replace('', pd.NA).dropna().unique()
+        mt_candidates = site_rows['mut_aa'].dropna().replace('', pd.NA).dropna().unique()
         wt = str(wt_candidates[0]) if len(wt_candidates) else ""
         mt = str(mt_candidates[0]) if len(mt_candidates) else ""
         mut_label = f"{chain}:{pos}:{wt}>{mt}" if wt else f"{chain}:{pos}:{mt}"
@@ -312,22 +383,31 @@ def plot_key_aa_ratio(key_df: pd.DataFrame, out_dir: str):
         ax.legend(title="amino acid", bbox_to_anchor=(1.02, 1), loc="upper left")
 
         for aa, container in zip(plot_df.columns, ax.containers):
-            labels = [f"{aa}\n{v:.2f}" if v > 0 else "" for v in container.datavalues]
-            ax.bar_label(container, labels=labels, label_type='edge', padding=2, fontsize=8)
+            lp_series = lp_wide[aa]
+            labels = []
+            for i, v in enumerate(container.datavalues):
+                lp = lp_series.iloc[i]
+                if v > 0:
+                    if pd.notna(lp):
+                        p = float(np.exp(lp))
+                        labels.append(f"{aa}\n{v:.2f}\n{p:.2f}")
+                    else:
+                        labels.append(f"{aa}\n{v:.2f}\nNA")
+                else:
+                        labels.append("")
+            ax.bar_label(container, labels=labels, label_type='center', padding=2, fontsize=8)
 
         ax.text(
             0.01, 0.98, mut_label,
-            transform=ax.transAxes,
-            ha='left', va='top',
-            fontsize=10,
+            transform=ax.transAxes, ha='left', va='top', fontsize=10,
             bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', boxstyle='round')
         )
 
-        fig3 = ax.get_figure()
-        fig3.tight_layout()
+        fig = ax.get_figure()
+        fig.tight_layout()
         out_name = f"key_aa_ratio_{chain}{pos}.png" if multi_site else "key_aa_ratio.png"
-        fig3.savefig(out_dir / out_name, dpi=180)
-        plt.close(fig3)
+        fig.savefig(out_dir / out_name, dpi=180)
+        plt.close(fig)
 
 
 def main():
