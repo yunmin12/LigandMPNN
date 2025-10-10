@@ -189,6 +189,10 @@ def analyze_pdb(results_dir: Path, pdb_id: str, mut: Mut, out_dir: Path):
     per_pos_records = []
     key_counts = {aa: 0 for aa in AA_LIST}
     total_reps = 0
+    
+    key_logit_sums = {aa: 0.0 for aa in AA_LIST}
+    key_logit_ns = {aa: 0 for aa in AA_LIST}
+    
     key_logprob_sums = {aa: 0.0 for aa in AA_LIST}
     key_logprob_ns   = {aa: 0   for aa in AA_LIST}
 
@@ -203,7 +207,13 @@ def analyze_pdb(results_dir: Path, pdb_id: str, mut: Mut, out_dir: Path):
         chosen_aa = [aa_cols[i] for i in argmax_idx]
         chosen_prob = probs[np.arange(L), argmax_idx]
         chosen_logit = logits[np.arange(L), argmax_idx] if logits is not None else np.full(L, np.nan)
-
+        row_logits = logits[key_ix]
+        for j, aa in enumerate(aa_cols):
+            a = aa.upper()
+            if a in AA_SET:
+                key_logit_sums[a] += float(row_logits[j])
+                key_logit_ns[a] += 1
+        
         row = probs[key_ix]
         for j, aa in enumerate(aa_cols):
             a = aa.upper()
@@ -232,6 +242,8 @@ def analyze_pdb(results_dir: Path, pdb_id: str, mut: Mut, out_dir: Path):
         print(f"[WARN] {pdb_id}: no usable replicates")
         return None
 
+    mean_logit = {aa: (key_logit_sums[aa] / key_logit_ns[aa] if key_logit_ns[aa] else np.nan)
+                  for aa in AA_LIST}
     mean_lp = {aa: (key_logprob_sums[aa] / key_logprob_ns[aa] 
                     if key_logprob_ns[aa] else np.nan)
                     for aa in AA_LIST}
@@ -334,6 +346,7 @@ def analyze_pdb(results_dir: Path, pdb_id: str, mut: Mut, out_dir: Path):
         "fraction": fracs[aa],
         "total_reps": total_reps,
         "mean_log_prob": float(mean_lp[aa]) if np.isfinite(mean_lp[aa]) else np.nan,
+        "mean_logit": float(mean_logit[aa]) if np.isfinite(mean_logit[aa]) else np.nan  # ← NEW
     } for aa in AA_LIST]
 
     return {
@@ -409,6 +422,57 @@ def plot_key_aa_ratio(key_df: pd.DataFrame, out_dir: str):
         fig.savefig(out_dir / out_name, dpi=180)
         plt.close(fig)
 
+def plot_key_aa_logits(key_df: pd.DataFrame, out_dir: str):
+    sites = key_df[['chain','pos']].drop_duplicates().to_records(index=False)
+    multi_site = len(sites) > 1
+
+    for chain, pos in sites:
+        df_site = key_df[(key_df['chain']==chain)&(key_df['pos']==pos)].copy()
+        if 'mean_logit' not in df_site.columns:
+            print(f"[WARN] mean_logit not found for site {chain}{pos}; skip")
+            continue
+        
+        agg = (df_site.groupby(['aa', 'pdb_id'], as_index=False)
+                      .agg(mean_logit=('mean_logit','mean')))
+
+        aas = sorted(agg['aa'].unique())
+        pdbs = sorted(agg['pdb_id'].unique())
+
+        logit_wide = (agg.pivot_table(index='aa', columns='pdb_id', values='mean_logit',
+                                      fill_value=np.nan, aggfunc='mean')
+                         .reindex(index=aas, columns=pdbs))
+
+        wt = df_site['wt_aa'].dropna().replace('', pd.NA).dropna().unique()
+        mt = df_site['mut_aa'].dropna().replace('', pd.NA).dropna().unique()
+        wt = str(wt[0]) if len(wt)>0 else None
+        mt = str(mt[0]) if len(mt)>0 else None
+        if wt or mt:
+            order = []
+            for x in [wt, mt]:
+                if x and x in logit_wide.index and x not in order:
+                    order.append(x)
+            order += [a for a in logit_wide.index if a not in order]
+            logit_wide = logit_wide.reindex(index=order)
+        
+        ax = logit_wide.plot(kind='bar', figsize=(12,5))
+        ax.set_xlabel("Amino acid at key mutation site")
+        ax.set_ylabel("Mean logit at key site")
+        ax.set_title(f"Key-site AA logits per PDB @ {chain}{pos}")
+        ax.legend(title="PDB", bbox_to_anchor=(1.02,1), loc="upper left")
+        ax.tick_params(axis='x', rotation=0)
+
+        for pdb, container in zip(logit_wide.columns, ax.containers):
+            labels = [f"{v:.2f}" if not np.isnan(v) else "" for v in container.datavalues]
+            ax.bar_label(container, labels=labels, label_type='edge', padding=2, fontsize=8)
+        mut_label = f"{chain}:{pos}:{(wt or '')}>{(mt or '')}" if wt else f"{chain}:{pos}:{(mt or '')}"
+        ax.text(0.01, 0.98, mut_label, transform=ax.transAxes, ha='left', va='top',
+                fontsize=10, bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', boxstyle='round'))
+        
+        fig = ax.get_figure()
+        fig.tight_layout()
+        out_name = f"key_aa_logits_{chain}{pos}.png" if multi_site else "key_aa_logits.png"
+        fig.savefig(out_dir/out_name, dpi=180)
+        plt.close(fig)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -451,6 +515,7 @@ def main():
         
         # 3) Key-site AA count bar (all PDBs)
         plot_key_aa_ratio(key_df, out_dir)
+        plot_key_aa_logits(key_df, out_dir)
 
     if all_per_pos:
         per_pos_cat = pd.concat(all_per_pos, ignore_index=True)
