@@ -313,10 +313,27 @@ class ProteinMPNN(torch.nn.Module):
                     t[:, None, None].repeat(1, 1, h_V_stack[-1].shape[-1]),
                 )[:, 0]
                 logits = self.W_out(h_V_t)  # [B,21]
-                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # [B,21]
+                logits_step = logits + bias_t
+                # log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # [B,21]
 
+                # external override and bias for logit-based negative design
+                external_override = feature_dict.get("external_logits_override", None)  # [B,21] or [B,L,21]
+                external_bias = feature_dict.get("external_logit_bias", None)
+
+                if external_override is not None:
+                    if external_override.dim() == 3:
+                        external_override = torch.gather(external_override, 1, t[:, None, None].repeat(1, 1, external_override.size(-1)))[:, 0]
+                    logits_step = external_override
+                elif external_bias is not None:
+                    if external_bias.dim() == 3:
+                        external_bias = torch.gather(external_bias, 1, t[:, None, None].repeat(1, 1, external_bias.size(-1)))[:, 0]
+                    logits_step = logits_step + external_bias
+                
+                logits_temp = logits_step / temperature
+                log_probs = torch.nn.functional.log_softmax(logits_temp, dim=-1)  # [B,21]
                 probs = torch.nn.functional.softmax(
-                    (logits + bias_t) / temperature, dim=-1
+                #     (logits + bias_t) / temperature, dim=-1
+                    logits_temp, dim=-1
                 )  # [B,21]
                 probs_sample = probs[:, :20] / torch.sum(
                     probs[:, :20], dim=-1, keepdim=True
@@ -347,6 +364,10 @@ class ProteinMPNN(torch.nn.Module):
                 "sampling_probs": all_probs,
                 "log_probs": all_log_probs,
                 "decoding_order": decoding_order,
+                # new elements for logit extraction
+                "logits": logits.detach(),
+                "logits_step": logits_step.detach(),
+                "logits_temp": logits_temp.detach(),
             }
         else:
             # weights for symmetric design
@@ -405,6 +426,9 @@ class ProteinMPNN(torch.nn.Module):
                 torch.zeros_like(h_V, device=device)
                 for _ in range(len(self.decoder_layers))
             ]
+            all_logits_step = torch.zeros(
+                (B_decoder, L, 21), device=device, dtype=torch.float32
+            )
 
             h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
             h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
@@ -412,6 +436,7 @@ class ProteinMPNN(torch.nn.Module):
 
             for t_list in new_decoding_order:
                 total_logits = 0.0
+                total_bias = 0.0
                 for t in t_list:
                     chain_mask_t = chain_mask[:, t]  # [B]
                     mask_t = mask[:, t]  # [B]
@@ -435,16 +460,47 @@ class ProteinMPNN(torch.nn.Module):
 
                     h_V_t = h_V_stack[-1][:, t]
                     logits = self.W_out(h_V_t)  # [B,21]
+
                     log_probs = torch.nn.functional.log_softmax(
                         logits, dim=-1
                     )  # [B,21]
                     all_log_probs[:, t] = (
                         chain_mask_t[:, None] * log_probs
                     ).float()  # [B,21]
-                    total_logits += symmetry_weights[t] * logits
 
+                    total_logits += symmetry_weights[t] * logits
+                    total_bias += symmetry_weights[t] * bias_t
+                    
+                total_logits_step = total_logits + total_bias
+
+                # external override and bias for logit-based negative design
+                external_override = feature_dict.get("external_logits_override", None)  # [B,21] or [B,L,21]
+                external_bias = feature_dict.get("external_logit_bias", None)
+
+                if external_override is not None:
+                    if external_override.dim() == 3:
+                        total_override = 0.0
+                        for t in t_list:
+                            total_override += symmetry_weights[t] * external_override[:, t, :]  # [B, 21]
+                        total_logits_step = total_override
+                    else:
+                        total_logits_step = external_override
+                elif external_bias is not None:
+                    if external_bias.dim() == 3:
+                        total_bias = 0.0
+                        for t in t_list:
+                            total_bias += symmetry_weights[t] * external_bias[:, t, :]  # [B, 21]
+                        total_logits_step += total_bias
+                    else:
+                        total_logits_step += external_bias
+                
+                for t in t_list:
+                    all_logits_step[:, t, :] = total_logits_step
+                
+                total_logits_temp = total_logits_step / temperature
                 probs = torch.nn.functional.softmax(
-                    (total_logits + bias_t) / temperature, dim=-1
+                    # (total_logits + bias_t) / temperature, dim=-1
+                    total_logits_temp, dim=-1
                 )  # [B,21]
                 probs_sample = probs[:, :20] / torch.sum(
                     probs[:, :20], dim=-1, keepdim=True
@@ -465,6 +521,11 @@ class ProteinMPNN(torch.nn.Module):
                 "sampling_probs": all_probs,
                 "log_probs": all_log_probs,
                 "decoding_order": decoding_order.repeat(B_decoder, 1),
+                # new elements for logit extraction
+                "logits": total_logits.detach(),
+                "logits_step": total_logits_step.detach(),
+                "logits_temp": total_logits_temp.detach(),
+                "all_logits_step": all_logits_step[0].detach()  # [L,21]
             }
         return output_dict
 
