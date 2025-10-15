@@ -411,6 +411,78 @@ def main(args) -> None:
             feature_dict["symmetry_residues"] = remapped_symmetry_residues
             feature_dict["symmetry_weights"] = symmetry_weights
 
+            def _make_off_feature_dict(off_pdb_path: str) -> dict:
+                # Parse and featurize off-target PDB(s)
+                off_protein_dict, _, _, off_icodes, _ = parse_PDB(
+                    off_pdb_path,
+                    device=device,
+                    chains=parse_these_chains_only_list,
+                    parse_all_atoms=parse_all_atoms_flag,
+                    parse_atoms_with_zero_occupancy=args.parse_atoms_with_zero_occupancy,
+                )
+                if off_protein_dict["R_idx"].shape != protein_dict["R_idx"].shape:
+                    raise RuntimeError("R_idx length mismatch between target and off-target.")
+                off_protein_dict["chain_mask"] = protein_dict["chain_mask"]
+                off_protein_dict["membrane_per_residue_labels"] = protein_dict["membrane_per_residue_labels"]
+                ofd = featurize(
+                    off_protein_dict,
+                    cutoff_for_score=args.ligand_mpnn_cutoff_for_score,
+                    use_atom_context=args.ligand_mpnn_use_atom_context,
+                    number_of_ligand_atoms=atom_context_num,
+                    model_type=args.model_type,
+                )
+                L_off = ofd["X"].shape[1]
+                assert L_off == L, "Off-target length mismatch"
+                ofd["batch_size"] = 1
+                ofd["temperature"] = args.temperature
+                ofd["bias"] = feature_dict["bias"].detach().clone()[:1]   # [1,L,21]
+                ofd["symmetry_residues"] = feature_dict["symmetry_residues"]
+                ofd["symmetry_weights"]  = feature_dict["symmetry_weights"]
+                return ofd
+
+            def _logit_pass(fd: dict) -> list:
+                fdc = copy.deepcopy(fd)
+                fdc["batch_size"] = 1
+                fdc["randn"] = torch.zeros([1, fdc["mask"].shape[1]], device=device)
+                fdc.pop("external_logits_override", None)
+                fdc.pop("external_logit_bias", None)
+                out = model.sample(fdc)
+                # out["logits"]: [L, 21] (before bias/override/temperature)
+                # out["logits_step"]: [L, 21] (after external/bias)
+                # out["logits_temp"]: [L, 21] (after temperature, before softmax)
+                return out["logits_step"].to(device)   # [L,21]
+                
+            if args.negative_enable and args.offtarget_pdb_path and len(args.offtarget_pdb_path) > 0:
+                # 1) target prepass
+                target_fd_pp = copy.deepcopy(feature_dict)
+                target_fd_pp["batch_size"] = 1
+                target_fd_pp["temperature"] = args.temperature
+                target_fd_pp["randn"] = torch.zeros([1, target_fd_pp["mask"].shape[1]], device=device)
+                target_fd_pp.pop("external_logits_override", None)
+                target_fd_pp.pop("external_logit_bias", None)
+                t_logp = _logit_pass(target_fd_pp)  # [L,21]
+
+                # 2) off-target prepass
+                off_logp_list = []
+                for off_p in args.offtarget_pdb_path:
+                    ofd = _make_off_feature_dict(off_p)
+                    ofd["randn"] = torch.zeros([1, ofd["mask"].shape[1]], device=device)
+                    off_logp_list.append(_logit_pass(ofd))  # [L,21]
+                
+                # 3) contrastive fused logits
+                if off_logp_list:
+                    offs = torch.stack(off_logp_list, 0)
+                    off_mean = offs.mean(0)  # [B-1,L,21] -> [L,21]
+                    lam = float(args.negative_weight)
+                    fused_logit_like = t_logp + lam * (t_logp - off_mean)  # [L,21]
+                    feature_dict["external_logits_override"] = fused_logit_like.unsqueeze(0)
+                    feature_dict["temperature"] = args.temperature
+
+                    feature_dict["_contrastive_debug"] = {
+                        "per_ligand_logits_step": torch.cat([t_logp.unsqueeze(0), offs], dim=0).detach().cpu(),
+                        "fused_logits_step": fused_logit_like.detach().cpu(),
+                    }
+
             sampling_probs_list = []
             log_probs_list = []
             decoding_order_list = []
@@ -488,6 +560,10 @@ def main(args) -> None:
             out_dict["chain_mask"] = feature_dict["chain_mask"][0].cpu()
             out_dict["seed"] = seed
             out_dict["temperature"] = args.temperature
+            dbg = feature_dict.pop("_contrastive_debug", None)
+            if dbg is not None:
+                out_dict["contrastive_per_ligand_logits_step"] = dbg["per_ligand_logits_step"]  # [B,L,21]
+                out_dict["contrastive_fused_logits_step"] = dbg["fused_logits_step"]  # [L,21]
             if args.save_stats:
                 torch.save(out_dict, output_stats_path)
             
@@ -1040,6 +1116,49 @@ if __name__ == "__main__":
         default=1,
         help="1-pack side chains using ligand context, 0 - do not use it.",
     )
+
+    # Additional arguments for logit-based negative design
+    argparser.add_argument(
+        "--offtarget_pdb_path", 
+        action="append", 
+        default=None,
+        help="Repeatable. PDB(s) for off-target ligand contexts. Same backbone/sequence indexing expected.",
+    )
+
+    argparser.add_argument(
+        "--negative_enable",
+        type=int,
+        default=1,
+        help="1 to enable contrastive decoding, 0 to disable.",
+    )
+
+    argparser.add_argument(
+        "--negative_weight", 
+        type=float, 
+        default=1.0,
+        help="Weight for off-target penalty (alpha).",
+    )
+
+    # argparser.add_argument(
+    #     "--negative_agg", 
+    #     choices=["mean", "max"], 
+    #     default="mean",
+    #     help="Aggregate multiple off-target logits by mean or max.",
+    # )
+
+    # argparser.add_argument(
+    #     "--negative_apply", 
+    #     choices=["logits", "log_probs"],
+    #     default="logits",
+    #     help="Substraction by logits or log_probs.",
+    # )
+
+    argparser.add_argument(
+        "--negative_residues",
+        type=str,
+        default="",
+        help="Designate the residues to give penalties. Space separated."
+        )
 
     args = argparser.parse_args()
     main(args)
