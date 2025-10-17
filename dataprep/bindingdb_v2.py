@@ -10,13 +10,16 @@ from pathlib import Path
 
 # ---------- Config ----------
 p = argparse.ArgumentParser(description="BindingDB curation set for ligand specificity evaluation.")
+p.add_argument("--input", dest="input_tsv", required=False, default="articles", choices=["articles", "all"], help="BindingDB input TSV. Choose articles (smaller) or all.")
 p.add_argument("--out", dest="output_path", required=True, help="Output CSV path")
 p.add_argument("--ensure_pdb", dest="ensure_pdb", required=False, default=False, help="Ensure all the ligands to have complex PDB ids. If not, leave ligands with at least one complex PDB ids in the same protein. Default: False.")
 p.add_argument("--same_mutation", dest="same_mutation", required=False, default=False, help="Remains off-targets that only has the same key_mutation with the target. Default: False.")
 args = p.parse_args()
 
-INPUT_TSV = "/home/yunmin/proj/data/db/BindingDB_BindingDB_Articles.tsv"
-INPUT_TSV_ALL = "/home/yunmin/proj/data/db/BindingDB_All.tsv"
+if args.input_tsv == "articles":
+    INPUT_TSV = "/home/yunmin/proj/data/db/BindingDB_BindingDB_Articles.tsv"
+elif args.input_tsv == "all":
+    INPUT_TSV = "/home/yunmin/proj/data/db/BindingDB_All.tsv"
 OUTPUT_CSV = args.output_path
 # OUTPUT_CSV = "/home/yunmin/proj/data/db/15_eval_set_1015.csv"
 SOLVENT_IDS = {
@@ -60,8 +63,79 @@ df = pd.read_csv(
     on_bad_lines="warn",
     thousands=None
     )
-df = df.rename(columns=lambda x: x.strip())
-df.columns = df.columns.str.strip()
+if args.input_tsv == "articles":
+    df = df.rename(columns=lambda x: x.strip())
+    df.columns = df.columns.str.strip()
+elif args.input_tsv == "all":
+    df.columns = df.columns.str.strip().str.replace(r"\s+", " ", regex=True)
+    def pick(*cands):
+        for c in cands:
+            if c in df.columns: 
+                return c
+        return None
+    
+    COL_CHAINS = pick(
+    "Number of Protein Chains in Target (>1 implies a multichain complex)"
+    )
+    COL_PDB_COMPLEX = pick("PDB ID(s) for Ligand-Target Complex")
+    COL_HET = pick("Ligand HET ID in PDB")
+    COL_LIG_SMILES = pick("Ligand SMILES")
+    COL_LIG_INCHIKEY = pick("Ligand InChI Key","Ligand InChIKey","Ligand InChi Key")
+    COL_LIG_NAME = pick("BindingDB Ligand Name")
+    COL_TARGET_NAME = pick("Target Name")
+    COL_ORG = pick("Target Source Organism According to Curator or DataSource")
+    COL_SEQ1 = pick("BindingDB Target Chain Sequence 1","BindingDB Target Chain Sequence")
+    COL_UP1  = pick("UniProt (SwissProt) Primary ID of Target Chain 1",
+                    "UniProt (SwissProt) Primary ID of Target Chain")
+    
+    ASSAY_KI   = pick("Ki (nM)")
+    ASSAY_KD   = pick("Kd (nM)")
+    ASSAY_IC50 = pick("IC50 (nM)")
+    ASSAY_EC50 = pick("EC50 (nM)")
+    assay_cols = [c for c in [ASSAY_KI,ASSAY_KD,ASSAY_IC50,ASSAY_EC50] if c]
+
+    missing = [name for name, col in {
+        "CHAINS":COL_CHAINS, "PDB_COMPLEX":COL_PDB_COMPLEX, "HET":COL_HET,
+        "SMILES":COL_LIG_SMILES, "InChIKey":COL_LIG_INCHIKEY, "LigName":COL_LIG_NAME,
+        "Target":COL_TARGET_NAME, "Organism":COL_ORG, "Seq1":COL_SEQ1, "UniProt1":COL_UP1
+    }.items() if col is None]
+    if missing:
+        print("WARN missing columns:", missing)
+
+    if COL_CHAINS:
+        chains = pd.to_numeric(df[COL_CHAINS].str.extract(r"(\d+)", expand=False), errors="coerce")
+        df = df[chains.fillna(1) <= 1].copy()
+
+    rename_map = {}
+    if COL_PDB_COMPLEX:  rename_map[COL_PDB_COMPLEX] = "PDB ID(s) for Ligand-Target Complex"
+    if COL_HET:          rename_map[COL_HET] = "Ligand HET ID in PDB"
+    if COL_LIG_SMILES:   rename_map[COL_LIG_SMILES] = "Ligand SMILES"
+    if COL_LIG_INCHIKEY: rename_map[COL_LIG_INCHIKEY] = "Ligand InChI Key"
+    if COL_LIG_NAME:     rename_map[COL_LIG_NAME] = "BindingDB Ligand Name"
+    if COL_TARGET_NAME:  rename_map[COL_TARGET_NAME] = "Target Name"
+    if COL_ORG:          rename_map[COL_ORG] = "Target Source Organism According to Curator or DataSource"
+    if COL_SEQ1:         rename_map[COL_SEQ1] = "BindingDB Target Chain Sequence"
+    if COL_UP1:          rename_map[COL_UP1]  = "UniProt (SwissProt) Primary ID of Target Chain"
+    df = df.rename(columns=rename_map)
+
+    chain_col="Number of Protein Chains in Target (>1 implies a multichain complex)"
+    chains = pd.to_numeric(df[chain_col].str.extract(r"(\d+)", expand=False), errors="coerce")
+    df = df[chains.fillna(1) <= 1].copy()
+
+    rename = {}
+    def pick(old1, old0, new):
+        if old1 in df.columns: rename[old1] = new
+        elif old0 in df.columns: rename[old0] = new
+
+    pick("BindingDB Target Chain Sequence 1", "BindingDB Target Chain Sequence",
+        "BindingDB Target Chain Sequence")
+    pick("UniProt (SwissProt) Primary ID of Target Chain 1",
+        "UniProt (SwissProt) Primary ID of Target Chain",
+        "UniProt (SwissProt) Primary ID of Target Chain")
+    pick("PDB ID(s) of Target Chain 1", "PDB ID(s) of Target Chain",
+        "PDB ID(s) of Target Chain")
+
+    df = df.rename(columns=rename)
 
 # Select useful columns
 cols = ["BindingDB Reactant_set_id","Ligand SMILES","Ligand InChI Key",
@@ -193,13 +267,13 @@ for (prot, org), g in agg.groupby(["UniProt (SwissProt) Primary ID of Target Cha
             rec["target_type"]="target"
             rec["target_type_vb"]="target"
         elif abs(dpX) < 0.3:  # ±2x
-            rec["target_type"]="off-target"
+            rec["target_type"]="off_target"
             rec["target_type_vb"]="nochange"
         elif dpX <= -1.0: # -10x
-            rec["target_type"]="off-target"
+            rec["target_type"]="off_target"
             rec["target_type_vb"]="negative"
         else: 
-            rec["target_type"]="off-target"
+            rec["target_type"]="off_target"
             rec["target_type_vb"]="below_par"
         records.append(rec)
 
