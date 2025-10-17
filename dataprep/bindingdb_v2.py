@@ -16,6 +16,7 @@ p.add_argument("--same_mutation", dest="same_mutation", required=False, default=
 args = p.parse_args()
 
 INPUT_TSV = "/home/yunmin/proj/data/db/BindingDB_BindingDB_Articles.tsv"
+INPUT_TSV_ALL = "/home/yunmin/proj/data/db/BindingDB_All.tsv"
 OUTPUT_CSV = args.output_path
 # OUTPUT_CSV = "/home/yunmin/proj/data/db/15_eval_set_1015.csv"
 SOLVENT_IDS = {
@@ -27,17 +28,6 @@ SOLVENT_IDS = {
 # ---------- Utility ----------
 def md5_seq(seq: str) -> str:
     return hashlib.md5(seq.encode()).hexdigest()
-
-def clean_nM(x):
-    if pd.isna(x): return np.nan
-    s = str(x).strip().replace(",", "")
-    if s.startswith((">", "<")):
-        s = s[1:].strip()
-    try:
-        v = float(s)
-        return np.nan if v <= 0 else v
-    except:
-        return np.nan
 
 def to_pX(nM: float) -> float:
     if pd.isna(nM): return np.nan
@@ -80,21 +70,45 @@ cols = ["BindingDB Reactant_set_id","Ligand SMILES","Ligand InChI Key",
         "Ki (nM)","Kd (nM)","IC50 (nM)","EC50 (nM)",
         "PDB ID(s) for Ligand-Target Complex",
         "BindingDB Target Chain Sequence",
-        "UniProt (SwissProt) Primary ID of Target Chain"]
+        "UniProt (SwissProt) Primary ID of Target Chain",
+        "Ligand HET ID in PDB"]
 df = df[[c for c in cols if c in df.columns]].copy()
 
 df["BindingDB Target Chain Sequence"] = df["BindingDB Target Chain Sequence"].fillna("").str.strip()
 df = df[df["BindingDB Target Chain Sequence"].str.len() > 0]
-# for col in ["Ki (nM)","Kd (nM)","IC50 (nM)","EC50 (nM)"]:
-#     if col in df.columns:
-#         df[col] = df[col].apply(clean_nM)
 # %%
 # ---------- Compute pX values ----------
 for col in ["Ki (nM)","Kd (nM)","IC50 (nM)","EC50 (nM)"]:
     if col in df.columns:
         df[col+"_pX"] = df[col].apply(to_pX)
 
-# Melt into tidy format
+# process multi assay and exception cases (>, <, ;)
+def parse_multi_nM(cell):
+    if cell is None or (isinstance(cell, float) and np.isnan(cell)): 
+        return []
+    vals = []
+    for tok in re.split(r"[;,\s]+", str(cell).strip()):
+        if not tok: 
+            continue
+        s = tok.replace(",", "").strip()
+        if s.startswith((">", "<")):
+            s = s[1:].strip()
+        try:
+            v = float(s)
+            if v > 0:
+                vals.append(v)
+        except:
+            pass
+    return vals
+
+def to_single_nM(cell):
+    xs = parse_multi_nM(cell)
+    return float(np.median(xs)) if xs else np.nan
+
+for col in ["Ki (nM)", "Kd (nM)", "IC50 (nM)", "EC50 (nM)"]:
+    if col in df.columns:
+        df[col] = df[col].apply(to_single_nM)
+
 melted = []
 for atype in ["Ki","Kd","IC50","EC50"]:
     nmcol = f"{atype} (nM)"
@@ -105,7 +119,9 @@ for atype in ["Ki","Kd","IC50","EC50"]:
               "Target Source Organism According to Curator or DataSource",
               nmcol, pxcol, "BindingDB Target Chain Sequence",
               "UniProt (SwissProt) Primary ID of Target Chain",
-              "PDB ID(s) for Ligand-Target Complex"]].copy()
+              "PDB ID(s) for Ligand-Target Complex",
+              "Ligand HET ID in PDB"
+              ]].copy()
     sub["assay_type"] = atype
     sub = sub.rename(columns={nmcol:"affinity_nM", pxcol:"pX"})
     melted.append(sub)
@@ -125,9 +141,10 @@ agg = df.groupby(group_cols).agg(
     ligand_inchikey=("Ligand InChI Key", first_nonnull),
     median_pX=("pX", median_ignore_nan),
     median_aff_nM=("affinity_nM", lambda x: median_ignore_nan(pd.to_numeric(x, errors='coerce'))),
-    complex_pdb_id=("PDB ID(s) for Ligand-Target Complex", lambda x: ";".join(sorted(set(x.dropna().astype(str)))))
+    complex_pdb_id=("PDB ID(s) for Ligand-Target Complex", lambda x: ";".join(sorted(set(x.dropna().astype(str))))),
+    bindingdb_pdb_hetid=("Ligand HET ID in PDB", first_nonnull), 
 ).reset_index()
-# %%
+
 # ---------- Determine WT per (protein, organism) ----------
 agg["BindingDB Target Chain Sequence"] = agg["BindingDB Target Chain Sequence"].str.upper()
 agg["seq_md5"] = agg["BindingDB Target Chain Sequence"].apply(md5_seq)
@@ -239,9 +256,15 @@ def use_bindingdb_hetid(pdb_ids: str, hetid: str) -> str:
         return np.nan
     ids = []
     if isinstance(pdb_ids, str):
-        for pid in pdb_ids:
+        pid_list = [x.strip().upper() for x in pdb_ids.split(",") if len(x.strip())==4]
+        for pid in pid_list:
             ids.append(f"{pid}:{het}")
     return ";".join(sorted(set(ids))) if ids else np.nan
+
+het = out["bindingdb_pdb_hetid"].astype("string").str.upper().str.strip()
+het = het.where(het.str.fullmatch(r"[A-Z0-9]{1,3}"), None) \
+         .where(~het.str.fullmatch(r"\d+"), None)
+out["bindingdb_pdb_hetid"] = het
 
 out["pdb_ligand_id"] = out.apply(
     lambda r: use_bindingdb_hetid(r.get("complex_pdb_id", np.nan), r.get("bindingdb_pdb_hetid", np.nan)),
@@ -325,10 +348,9 @@ def pdb_ligand_inchikeys(pdb_id: str) -> List[str]:
 
 pdb_lig_map = {}
 for pdb in sorted(set(",".join(out["complex_pdb_id"].dropna()).split(","))):
-    print(pdb)
     if pdb.strip()=="" or len(pdb.strip()) != 4: continue
     pdb_lig_map[pdb] = pdb_ligand_inchikeys(pdb)
-print("pdb_lig_map: ", pdb_lig_map)
+
 def match_lig(pdb_ids: str) -> str:
     if not isinstance(pdb_ids, str): return np.nan
     ids = [x.strip().upper() for x in pdb_ids.split(",") if len(x.strip())==4]
@@ -342,6 +364,22 @@ def match_lig(pdb_ids: str) -> str:
     return ",".join(sorted(set(hits))) if hits else np.nan
 
 out["pdb_ligand_id"] = out["complex_pdb_id"].apply(match_lig)
+
+def union_row_ligands(pdb_ids, hetid):
+    pairs = {tok for tok in str(use_bindingdb_hetid(pdb_ids, hetid)).split(",") if ":" in tok}
+    # use_bindingdb_hetid가 문제임 여기서 nan이 뜨고 아무것도 못 불러오고 있음
+    pid_list = [t[:4].upper() for t in re.split(r"[,\s;]+", str(pdb_ids)) if len(t)>=4]
+    for pid in pid_list:
+        for lig in pdb_lig_map.get(pid, set()):
+            if lig not in SOLVENT_IDS and not "UNK":
+                pairs.add(f"{pid}:{lig}")
+    return ",".join(sorted(set(pairs))) if pairs else np.nan
+
+out["pdb_ligand_id"] = out.apply(
+    lambda r: union_row_ligands(r.get("complex_pdb_id", np.nan), r.get("bindingdb_pdb_hetid", np.nan)),
+    axis=1
+)
+
 # %%
 # ---------- Save ----------
 # if "ligand_inchikey" in out.columns and "Ligand InChI Key" not in out.columns:
