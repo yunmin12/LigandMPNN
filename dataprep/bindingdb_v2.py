@@ -26,7 +26,8 @@ SOLVENT_IDS = {
     "HOH","WAT","DOD",  # water
     "CL","NA","K","CA","MG","ZN","MN","CO","CU","NI","IOD",  # common ions
     "SO4","PO4",  # anions
-    "GOL","EDO","PEG","PG4","MPD","TRS","MES","ACE","IPA","BME","FMT"  # common buffers/additives
+    "GOL","EDO","PEG","PG4","MPD","TRS","MES","ACE","IPA","BME","FMT",  # common buffers/additives
+    "SEP", "TPO"    # modified residues
 }
 # ---------- Utility ----------
 def md5_seq(seq: str) -> str:
@@ -152,10 +153,6 @@ df["BindingDB Target Chain Sequence"] = df["BindingDB Target Chain Sequence"].fi
 df = df[df["BindingDB Target Chain Sequence"].str.len() > 0]
 # %%
 # ---------- Compute pX values ----------
-for col in ["Ki (nM)","Kd (nM)","IC50 (nM)","EC50 (nM)"]:
-    if col in df.columns:
-        df[col+"_pX"] = df[col].apply(to_pX)
-
 # process multi assay and exception cases (>, <, ;)
 def parse_multi_nM(cell):
     if cell is None or (isinstance(cell, float) and np.isnan(cell)): 
@@ -182,6 +179,10 @@ def to_single_nM(cell):
 for col in ["Ki (nM)", "Kd (nM)", "IC50 (nM)", "EC50 (nM)"]:
     if col in df.columns:
         df[col] = df[col].apply(to_single_nM)
+
+for col in ["Ki (nM)","Kd (nM)","IC50 (nM)","EC50 (nM)"]:
+    if col in df.columns:
+        df[col+"_pX"] = 9 - np.log10(pd.to_numeric(df[col], errors="coerce"))
 
 melted = []
 for atype in ["Ki","Kd","IC50","EC50"]:
@@ -213,12 +214,12 @@ agg = df.groupby(group_cols).agg(
     ligand_name=("BindingDB Ligand Name", first_nonnull),
     ligand_smiles=("Ligand SMILES", first_nonnull),
     ligand_inchikey=("Ligand InChI Key", first_nonnull),
-    median_pX=("pX", median_ignore_nan),
     median_aff_nM=("affinity_nM", lambda x: median_ignore_nan(pd.to_numeric(x, errors='coerce'))),
     complex_pdb_id=("PDB ID(s) for Ligand-Target Complex", lambda x: ";".join(sorted(set(x.dropna().astype(str))))),
     bindingdb_pdb_hetid=("Ligand HET ID in PDB", first_nonnull), 
 ).reset_index()
 
+agg["median_pX"] = 9 - np.log10(agg["median_aff_nM"])
 # ---------- Determine WT per (protein, organism) ----------
 agg["BindingDB Target Chain Sequence"] = agg["BindingDB Target Chain Sequence"].str.upper()
 agg["seq_md5"] = agg["BindingDB Target Chain Sequence"].apply(md5_seq)
@@ -258,7 +259,7 @@ for (prot, org), g in agg.groupby(["UniProt (SwissProt) Primary ID of Target Cha
         wt_row = match.iloc[0]
         rec["pX_wt"] = wt_row["median_pX"]
         rec["affinity_wt_nM"] = wt_row["median_aff_nM"]
-        rec["delta_pX"] = row["median_pX"] - wt_row["median_pX"]
+        rec["delta_pX"] = np.log10(float(rec["affinity_wt_nM"]) / float(row["median_aff_nM"]))
         dpX = rec["delta_pX"]
         if pd.isna(dpX): 
             rec["target_type"]=np.nan
@@ -441,11 +442,10 @@ out["pdb_ligand_id"] = out["complex_pdb_id"].apply(match_lig)
 
 def union_row_ligands(pdb_ids, hetid):
     pairs = {tok for tok in str(use_bindingdb_hetid(pdb_ids, hetid)).split(",") if ":" in tok}
-    # use_bindingdb_hetid가 문제임 여기서 nan이 뜨고 아무것도 못 불러오고 있음
     pid_list = [t[:4].upper() for t in re.split(r"[,\s;]+", str(pdb_ids)) if len(t)>=4]
     for pid in pid_list:
         for lig in pdb_lig_map.get(pid, set()):
-            if lig not in SOLVENT_IDS and not "UNK":
+            if lig not in SOLVENT_IDS and lig != "UNK":
                 pairs.add(f"{pid}:{lig}")
     return ",".join(sorted(set(pairs))) if pairs else np.nan
 
@@ -466,11 +466,11 @@ sel_cols = ["protein_key","target_name","ligand_name","ligand_smiles",
 out = out[sel_cols]
 out = out.rename(columns={
     "BindingDB Target Chain Sequence":"sequence",
-    "affinity_wt_nM":"wt_affinity_mid",
-    "median_aff_nM":"mut_affinity_mid",
-    "pX_wt":"wt_p_aff",
-    "median_pX":"mut_p_aff",
-    "delta_pX":"delta_p_aff"  # delta_pX = mut_p_aff - wt_p_aff
+    "affinity_wt_nM":"wt_affinity_nM",
+    "median_aff_nM":"mut_affinity_nM",
+    "pX_wt":"wt_pX",
+    "median_pX":"mut_pX",
+    "delta_pX":"delta_pX"  # delta_pX = mut_p_aff - wt_p_aff
 })
 out.to_csv(OUTPUT_CSV, index=False)
 print(f"✅ Saved: {OUTPUT_CSV}, total {len(out)} entries")
