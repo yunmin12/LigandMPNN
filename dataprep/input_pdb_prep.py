@@ -5,11 +5,16 @@ from typing import List, Dict, Optional, Tuple, Set
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdMolAlign, rdFMCS, rdchem
 
-
 # ---------- utils ----------
 RCSB_PDB_URL = "https://files.rcsb.org/download/{pdb_id}.pdb"
 
 def mkdir(p): os.makedirs(p, exist_ok=True)
+
+def safe_name(s: str) -> str:
+    return re.sub(r"[^\w\-.]", "_", str(s))
+
+def norm_ttype(s: str) -> str:
+    return (str(s) or "").strip().lower().replace("-", "_")
 
 def download_pdb(pdb_id: str, out_path: str, timeout=30) -> bool:
     url = RCSB_PDB_URL.format(pdb_id=pdb_id.upper())
@@ -20,11 +25,11 @@ def download_pdb(pdb_id: str, out_path: str, timeout=30) -> bool:
     return False
 
 def parse_resname_map(raw: str) -> Dict[str, str]:
+    """'6TA3:MZK;6TIW:MZK' -> {'6TA3':'MZK','6TIW':'MZK'} (따옴표/전각/쉼표 정규화)"""
     m = {}
     if not isinstance(raw, str) or not raw.strip():
         return m
-    s = raw.strip()
-    s = s.strip().strip("'").strip('"')
+    s = raw.strip().strip("'").strip('"')
     s = s.replace("：", ":").replace("；", ";").replace("，", ",")
     for tok in re.split(r"[;,\s]+", s):
         if not tok or ":" not in tok:
@@ -36,8 +41,7 @@ def parse_resname_map(raw: str) -> Dict[str, str]:
             m[pid] = rn
     return m
 
-
-def smiles_to_3d_pdb_block(smiles: str, resname: str="UNK") -> Optional[str]:
+def smiles_to_3d_pdb_block(smiles: str, resname: str="LIG") -> Optional[str]:
     mol = Chem.MolFromSmiles(smiles)
     if mol is None: return None
     mol = Chem.AddHs(mol)
@@ -65,23 +69,31 @@ def smiles_to_3d_pdb_block(smiles: str, resname: str="UNK") -> Optional[str]:
 
     for a in mol.GetAtoms():
         info = rdchem.AtomPDBResidueInfo()
-        info.SetResidueName((resname or "UNK")[:3]); info.SetResidueNumber(1)
+        info.SetResidueName((resname or "LIG")[:3]); info.SetResidueNumber(1)
         info.SetChainId('Z'); info.SetIsHeteroAtom(True)
         a.SetMonomerInfo(info)
     return Chem.MolToPDBBlock(mol)
 
-def read_text(p): 
+def read_text(p):
     with open(p, "r") as f: return f.read()
 
-def write_text(p, s): 
+def write_text(p, s):
     with open(p, "w") as f: f.write(s)
+
+def extract_ligand_block_by_resname(pdb_text: str, resname: str) -> Optional[str]:
+    lines = []
+    for line in pdb_text.splitlines():
+        if line.startswith("HETATM") and line[17:20].strip().upper() == (resname or "").upper():
+            lines.append(line)
+    if not lines: return None
+    return "\n".join(lines) + "\n"
 
 def remove_resname_from_pdb(pdb_text: str, resname: str) -> str:
     out = []
     for line in pdb_text.splitlines():
         if line.startswith("HETATM") and line[17:20].strip().upper() == (resname or "").upper():
             continue
-        if line.startswith("CONECT"):  # drop all
+        if line.startswith("CONECT"):  # 간단화: CONECT는 제거
             continue
         out.append(line)
     return "\n".join(out) + "\n"
@@ -100,14 +112,6 @@ def pdb_block_to_mol(pdb_block: str) -> Optional[Chem.Mol]:
     except Exception:
         return None
 
-def extract_ligand_block(pdb_text: str, resname: str) -> Optional[str]:
-    lines = []
-    for line in pdb_text.splitlines():
-        if line.startswith("HETATM") and line[17:20].strip().upper() == resname.upper():
-            lines.append(line)
-    if not lines: return None
-    return "\n".join(lines) + "\n"
-
 def align_to_pose(mov: Chem.Mol, ref: Chem.Mol) -> Chem.Mol:
     res = rdFMCS.FindMCS([ref, mov], timeout=10, completeRingsOnly=True, ringMatchesRingOnly=True, matchChiralTag=False)
     if res and res.smartsString:
@@ -118,14 +122,13 @@ def align_to_pose(mov: Chem.Mol, ref: Chem.Mol) -> Chem.Mol:
             amap = list(zip(mov_match, ref_match))
             rdMolAlign.AlignMol(mov, ref, atomMap=amap)
             return mov
-    # fallback: global
     rdMolAlign.AlignMol(mov, ref)
     return mov
 
-def set_resname_all_atoms(m: Chem.Mol, resname="UNK", chain="Z", resnum=1):
+def set_resname_all_atoms(m: Chem.Mol, resname="LIG", chain="Z", resnum=1):
     for a in m.GetAtoms():
         info = rdchem.AtomPDBResidueInfo()
-        info.SetResidueName((resname or "UNK")[:3])
+        info.SetResidueName((resname or "LIG")[:3])
         info.SetResidueNumber(resnum)
         info.SetChainId(chain)
         info.SetIsHeteroAtom(True)
@@ -133,206 +136,195 @@ def set_resname_all_atoms(m: Chem.Mol, resname="UNK", chain="Z", resnum=1):
 
 # ---------- core ----------
 def process_group(gdf: pd.DataFrame, protein_key: str, out_dir: str, summary_rows: List[dict]):
-    safe_key = re.sub(r"[^\w\-\.]", "_", str(protein_key))
-    pdir = os.path.join(out_dir, safe_key)
-    mkdir(pdir)
+    # Directory: {uniprot_key}_{key_mutation}
+    base_key = re.split(r'[_\s]+', str(protein_key).strip())[0]
+    if "key_mutation" in gdf.columns and len(gdf["key_mutation"].dropna())>0:
+        raw_mut = str(gdf["key_mutation"].dropna().astype(str).iloc[0])
+    else:
+        raw_mut = "WT"
+    mut_list = re.findall(r"[A-Z]\d+[A-Z]", raw_mut)
+    mut_part = "_".join(mut_list) if mut_list else "WT"
 
-    # filter rows with non-empty complex_pdb_id
-    rows = []
+    safe_root = f"{safe_name(base_key)}_{safe_name(mut_part)}"
+    pdir = os.path.join(out_dir, safe_root); mkdir(pdir)
+    complex_dir  = os.path.join(pdir, "complex");  mkdir(complex_dir)
+    standard_dir = os.path.join(pdir, "standard"); mkdir(standard_dir)
+    ligands_dir  = os.path.join(pdir, "ligands");  mkdir(ligands_dir)
+    lig_target   = os.path.join(ligands_dir, "target"); mkdir(lig_target)
+    lig_off      = os.path.join(ligands_dir, "off");    mkdir(lig_off)
+    replaced_dir = os.path.join(pdir, "replaced"); mkdir(replaced_dir)
+
+    def warn(basis_id: str, off_lig_id: str, msg: str):
+        summary_rows.append({
+            "protein_key": base_key,
+            "key_mutation": mut_part,
+            "basis_pdb_id": basis_id or "",
+            "off_target_ligand_id": off_lig_id or "",
+            "status": "warn",
+            "message": msg,
+            "output_file": ""
+        })
+        print(f"[WARN] {base_key}_{mut_part} / {basis_id}: {msg}", file=sys.stderr)
+
+    # pass a row with empty complex_pdb_id
+    rows: List[pd.Series] = []
     for _, r in gdf.iterrows():
         cids = str(r.get("complex_pdb_id","") or "").strip()
         if not cids or cids.lower() in ["nan","none",""]:
-            # pass row entirely
             continue
         rows.append(r)
-    if not rows: return
+    if not rows: 
+        return
 
-    # download PDBs and collect maps
-    target_pdb_ids: Set[str] = set()
-    off_pdb_ids: Set[str]    = set()
-    group_resname_map: Dict[str,str] = {}  # PDBID -> resname (first wins)
-
-    # merged resname map over rows
+    # PDBID->resname mapping (first appearance is taken)
+    group_resname_map: Dict[str,str] = {}
     for r in rows:
         m = parse_resname_map(str(r.get("pdb_ligand_id","") or ""))
         for k,v in m.items():
-            if k not in group_resname_map: group_resname_map[k]=v
+            if k not in group_resname_map: group_resname_map[k] = v
 
+    # Download complex PDBs
+    target_pdb_ids: Set[str] = set()
+    off_pdb_ids: Set[str]    = set()
     for r in rows:
-        ttype = str(r.get("target_type","") or "").strip().lower()
+        ttype = norm_ttype(r.get("target_type",""))
         cids = [p.strip().upper() for p in re.split(r"[,\s]+", str(r["complex_pdb_id"]).strip()) if p.strip()]
         for pid in cids:
-            path = os.path.join(pdir, f"{pid}.pdb")
+            path = os.path.join(complex_dir, f"{pid}.pdb")
+            if os.path.exists(path):
+                if ttype == "off_target": off_pdb_ids.add(pid)
+                else: target_pdb_ids.add(pid)
+                continue
             ok = download_pdb(pid, path)
             if ok:
-                if ttype == "off-target": off_pdb_ids.add(pid)
+                if ttype == "off_target": off_pdb_ids.add(pid)
                 else: target_pdb_ids.add(pid)
 
-    # build ligand for each row
+    # Generate and save the ligand PDBs (ligands/target or off/{ligand_id}.pdb)
     row_lig_blocks: Dict[int, str] = {}
     row_lig_resname: Dict[int, str] = {}
     for idx, r in enumerate(rows):
         smiles = str(r.get("ligand_smiles","") or "").strip()
-        if not smiles: continue
+        if not smiles: 
+            continue
         cids = [p.strip().upper() for p in re.split(r"[,\s]+", str(r["complex_pdb_id"]).strip()) if p.strip()]
         row_map = parse_resname_map(str(r.get("pdb_ligand_id","") or ""))
         resname = None
         for cid in cids:
             if cid in row_map:
-                resname = row_map[cid]
-                break
+                resname = row_map[cid]; break
         if resname is None and len(set(group_resname_map.values())) == 1 and len(group_resname_map) > 0:
-            resname = list(group_resname_map.values())[0]
+            resname = list(set(group_resname_map.values()))[0]
         if resname is None:
-            resname = "UNK"
+            resname = "LIG"
+
         block = smiles_to_3d_pdb_block(smiles, resname=resname)
         if block:
-            safe_ttype = re.sub(r"[^\w\-.]", "_", str(r.get("target_type","") or "").strip().lower())
-            lig_path = os.path.join(pdir, f"{protein_key}_{safe_ttype}_{idx}_{resname}.pdb")
-            write_text(lig_path, block)
+            ttype = norm_ttype(r.get("target_type",""))
+            lig_dir = lig_target if ttype == "target" else lig_off
+            lig_path = os.path.join(lig_dir, f"{resname}.pdb")
+            if not os.path.exists(lig_path):
+                write_text(lig_path, block)
             row_lig_blocks[idx]  = block
             row_lig_resname[idx] = resname
 
-    # summary helper
-    def emit_summary(saved_pid: str, ttype: str, extra: dict, created: bool, basis: str, saved_t_ids: List[str], saved_o_ids: List[str], saved_t_lids: List[str], saved_o_lids: List[str]):
+    def emit_download_summary(saved_pid: str, ttype: str):
         row = {
-            "protein_key": protein_key,
+            "protein_key": base_key,
+            "key_mutation": mut_part,
             "target_type": ttype,
-            "protein": extra.get("protein",""),
-            "ligand":  extra.get("ligand",""),
-            "sequence": extra.get("sequence",""),
-            "key_mutation": extra.get("key_mutation",""),
-            "saved_target_pdb_id": ";".join(sorted(set(saved_t_ids))) if saved_t_ids else "",
-            "saved_off_target_pdb_id": ";".join(sorted(set(saved_o_ids))) if saved_o_ids else "",
-            "saved_target_ligand_id": ";".join(sorted(set(saved_t_lids))) if saved_t_lids else "",
-            "saved_off_target_ligand_id": ";".join(sorted(set(saved_o_lids))) if saved_o_lids else "",
-            "off_target_pdb_created": "yes" if created else "no",
-            "placement_basis": basis,
             "saved_pdb_id": saved_pid or "",
+            "saved_target_pdb_id": ";".join(sorted(target_pdb_ids)) if target_pdb_ids else "",
+            "saved_off_target_pdb_id": ";".join(sorted(off_pdb_ids)) if off_pdb_ids else "",
+            "saved_target_ligand_id": ";".join(sorted({v for k,v in group_resname_map.items() if k in target_pdb_ids})) if target_pdb_ids else "",
+            "saved_off_target_ligand_id": ";".join(sorted({v for k,v in group_resname_map.items() if k in off_pdb_ids})) if off_pdb_ids else "",
+            "off_target_pdb_created": "no",
+            "placement_basis": "none",
+            "status": "info",
+            "message": "",
+            "output_file": ""
         }
         summary_rows.append(row)
 
-    # collect ligand-id summaries
-    all_target_rows = [r for r in rows if str(r.get("target_type","")).strip().lower()=="target"]
-    all_off_rows    = [r for r in rows if str(r.get("target_type","")).strip().lower()=="off-target"]
-    saved_t_lids = []
-    saved_o_lids = []
-    for r in all_target_rows:
-        m = parse_resname_map(str(r.get("pdb_ligand_id","") or "")); saved_t_lids += list(m.values())
-    for r in all_off_rows:
-        m = parse_resname_map(str(r.get("pdb_ligand_id","") or "")); saved_o_lids += list(m.values())
-
-    # emit download summaries per saved PDB
     for pid in sorted(target_pdb_ids):
-        extra = {}
-        if "protein" in gdf.columns: extra["protein"]=rows[0].get("protein","")
-        if "ligand"  in gdf.columns: extra["ligand"]=rows[0].get("ligand","")
-        if "sequence" in gdf.columns: extra["sequence"]=rows[0].get("sequence","")
-        if "key_mutation" in gdf.columns: extra["key_mutation"]=rows[0].get("key_mutation","")
-        emit_summary(pid, "target", extra, created=False, basis="none",
-                     saved_t_ids=list(target_pdb_ids), saved_o_ids=list(off_pdb_ids),
-                     saved_t_lids=saved_t_lids, saved_o_lids=saved_o_lids)
+        emit_download_summary(pid, "target")
     for pid in sorted(off_pdb_ids):
-        extra = {}
-        if "protein" in gdf.columns: extra["protein"]=rows[0].get("protein","")
-        if "ligand"  in gdf.columns: extra["ligand"]=rows[0].get("ligand","")
-        if "sequence" in gdf.columns: extra["sequence"]=rows[0].get("sequence","")
-        if "key_mutation" in gdf.columns: extra["key_mutation"]=rows[0].get("key_mutation","")
-        emit_summary(pid, "off-target", extra, created=False, basis="none",
-                     saved_t_ids=list(target_pdb_ids), saved_o_ids=list(off_pdb_ids),
-                     saved_t_lids=saved_t_lids, saved_o_lids=saved_o_lids)
+        emit_download_summary(pid, "off-target")
 
-    # ---------- placement ----------
-    created_any = False
+    # ---------- Only when target complex PDB exists ----------
+    for basis_id in sorted(target_pdb_ids):
+        basis_path = os.path.join(complex_dir, f"{basis_id}.pdb")
+        if not os.path.exists(basis_path):
+            warn(basis_id, "", "Basis PDB not found on disk.")
+            continue
+        basis_txt = read_text(basis_path)
 
-    # Case A: target PDB exists → place each off-target ligand into each target basis
-    if target_pdb_ids:
-        for o_idx, o_row in enumerate(all_off_rows):
-            if o_idx not in row_lig_blocks: continue
-            off_block = row_lig_blocks[o_idx]
+        basis_res = group_resname_map.get(basis_id, None)
+        if not basis_res:
+            warn(basis_id, "", f"Missing mapped ligand residue for basis {basis_id}.")
+            continue
+
+        tgt_block = extract_ligand_block_by_resname(basis_txt, basis_res)
+        if not tgt_block:
+            warn(basis_id, "", f"Target ligand '{basis_res}' not found in basis {basis_id}.")
+            continue
+
+        tgt_mol = pdb_block_to_mol(tgt_block)
+        if tgt_mol is None:
+            warn(basis_id, "", f"Basis ligand parse failed for {basis_id} (PDB parse).")
+            continue
+        else:
+            set_resname_all_atoms(tgt_mol, resname=basis_res, chain="Z", resnum=1)
+            std_block = Chem.MolToPDBBlock(tgt_mol)
+
+            standardized = combine_protein_and_ligand(basis_txt, std_block, drop_resname=basis_res)
+
+            outp_std = os.path.join(standard_dir, f"{safe_root}_{basis_id}_{basis_res}.pdb")
+            write_text(outp_std, standardized)
+
+        tgt_mol = Chem.AddHs(tgt_mol, addCoords=True)
+
+        # Replace with off-target ligands
+        for idx, r in enumerate(rows):
+            ttype = norm_ttype(r.get("target_type",""))
+            if ttype != "off_target":
+                continue
+            if idx not in row_lig_blocks:
+                warn(basis_id, "", "Off-target ligand PDB for this row is missing (skipped).")
+                continue
+
+            off_resname = row_lig_resname.get(idx, "LIG")
+            off_block   = row_lig_blocks[idx]
             off_mol = pdb_block_to_mol(off_block)
-            if off_mol is None: 
-                raise RuntimeError(f"[{protein_key}] Off-target ligand parse failed (row {o_idx}).")
+            if off_mol is None:
+                warn(basis_id, off_resname, "Off-target ligand parse failed for this row.")
+                continue
             off_mol = Chem.AddHs(off_mol, addCoords=True)
 
-            for basis_id in sorted(target_pdb_ids):
-                basis_path = os.path.join(pdir, f"{basis_id}.pdb")
-                basis_txt  = read_text(basis_path)
-                basis_res  = group_resname_map.get(basis_id, None)
-                if not basis_res:
-                    raise RuntimeError(f"[{protein_key}] Missing resname for basis {basis_id} to replace.")
-                tgt_block = extract_ligand_block(basis_txt, basis_res)
-                if not tgt_block:
-                    raise RuntimeError(f"[{protein_key}] Cannot find ligand {basis_res} in basis {basis_id}.")
-                tgt_mol = pdb_block_to_mol(tgt_block)
-                if tgt_mol is None: 
-                    raise RuntimeError(f"[{protein_key}] Basis ligand parse failed for {basis_id}.")
-                tgt_mol = Chem.AddHs(tgt_mol, addCoords=True)
-
+            try:
                 aligned = align_to_pose(off_mol, tgt_mol)
-                set_resname_all_atoms(aligned, resname=basis_res, chain="Z", resnum=1)
-                aligned_block = Chem.MolToPDBBlock(aligned)
+            except Exception as e:
+                warn(basis_id, off_resname, f"Align failed: {e}")
+                continue
 
-                combined = combine_protein_and_ligand(basis_txt, aligned_block, drop_resname=basis_res)
-                outp = os.path.join(pdir, f"{protein_key}__placed_offtarget__basis-{basis_id}.pdb")
-                write_text(outp, combined)
-                created_any = True
+            set_resname_all_atoms(aligned, resname=off_resname, chain="Z", resnum=1)
+            aligned_block = Chem.MolToPDBBlock(aligned)
 
-                extra = {}
-                if "protein" in gdf.columns: extra["protein"]=rows[0].get("protein","")
-                if "ligand"  in gdf.columns: extra["ligand"]=rows[0].get("ligand","")
-                if "sequence" in gdf.columns: extra["sequence"]=rows[0].get("sequence","")
-                if "key_mutation" in gdf.columns: extra["key_mutation"]=rows[0].get("key_mutation","")
-                emit_summary(basis_id, "off-target", extra, created=True, basis="target",
-                             saved_t_ids=list(target_pdb_ids), saved_o_ids=list(off_pdb_ids),
-                             saved_t_lids=saved_t_lids, saved_o_lids=saved_o_lids)
+            combined = combine_protein_and_ligand(basis_txt, aligned_block, drop_resname=basis_res)
+            outp = os.path.join(replaced_dir, f"{safe_root}_{basis_id}_{off_resname}.pdb")
+            write_text(outp, combined)
 
-    # Case B: no target PDB, but off-target PDB exists and target ligand exists → place target ligand into off-target basis
-    elif off_pdb_ids and any(idx for idx,_ in enumerate(all_target_rows) if idx in row_lig_blocks):
-        for t_idx, t_row in enumerate(all_target_rows):
-            if t_idx not in row_lig_blocks: continue
-            tgtlig_block = row_lig_blocks[t_idx]
-            tgtlig_mol = pdb_block_to_mol(tgtlig_block)
-            if tgtlig_mol is None:
-                raise RuntimeError(f"[{protein_key}] Target ligand parse failed (row {t_idx}).")
-            tgtlig_mol = Chem.AddHs(tgtlig_mol, addCoords=True)
-
-            for basis_id in sorted(off_pdb_ids):
-                basis_path = os.path.join(pdir, f"{basis_id}.pdb")
-                basis_txt  = read_text(basis_path)
-                basis_res  = group_resname_map.get(basis_id, None)
-                if not basis_res:
-                    raise RuntimeError(f"[{protein_key}] Missing resname for basis {basis_id} to replace.")
-                basis_lig_block = extract_ligand_block(basis_txt, basis_res)
-                if not basis_lig_block:
-                    raise RuntimeError(f"[{protein_key}] Cannot find ligand {basis_res} in basis {basis_id}.")
-                basis_lig = pdb_block_to_mol(basis_lig_block)
-                if basis_lig is None:
-                    raise RuntimeError(f"[{protein_key}] Basis ligand parse failed for {basis_id}.")
-                basis_lig = Chem.AddHs(basis_lig, addCoords=True)
-
-                aligned = align_to_pose(tgtlig_mol, basis_lig)
-                set_resname_all_atoms(aligned, resname=basis_res, chain="Z", resnum=1)
-                aligned_block = Chem.MolToPDBBlock(aligned)
-
-                combined = combine_protein_and_ligand(basis_txt, aligned_block, drop_resname=basis_res)
-                outp = os.path.join(pdir, f"{protein_key}__placed_targetlig__basis-{basis_id}.pdb")
-                write_text(outp, combined)
-                created_any = True
-
-                extra = {}
-                if "protein" in gdf.columns: extra["protein"]=rows[0].get("protein","")
-                if "ligand"  in gdf.columns: extra["ligand"]=rows[0].get("ligand","")
-                if "sequence" in gdf.columns: extra["sequence"]=rows[0].get("sequence","")
-                if "key_mutation" in gdf.columns: extra["key_mutation"]=rows[0].get("key_mutation","")
-                emit_summary(basis_id, "target", extra, created=True, basis="off_target",
-                             saved_t_ids=list(target_pdb_ids), saved_o_ids=list(off_pdb_ids),
-                             saved_t_lids=saved_t_lids, saved_o_lids=saved_o_lids)
-
-    # If neither A nor B created anything, mark failed placement rows (download summaries already emitted)
-    if not created_any:
-        # nothing extra to emit; downloads already recorded with created=no
-        pass
+            summary_rows.append({
+                "protein_key": base_key,
+                "key_mutation": mut_part,
+                "basis_pdb_id": basis_id,
+                "off_target_ligand_id": off_resname,
+                "status": "ok",
+                "message": "",
+                "output_file": outp,
+                "placement_basis": "target",
+                "off_target_pdb_created": "yes"
+            })
 
 def main():
     p = argparse.ArgumentParser()
@@ -344,39 +336,26 @@ def main():
     df = pd.read_csv(args.input_csv)
 
     # required columns
-    req = ["protein_key","target_type","complex_pdb_id","ligand_smiles","pdb_ligand_id"]
+    req = ["protein_key","target_type","complex_pdb_id","ligand_smiles","pdb_ligand_id","key_mutation"]
     for c in req:
         if c not in df.columns:
             raise ValueError(f"Missing required column: {c}")
 
     summary_rows: List[dict] = []
 
-    for protein_key, gdf in df.groupby("protein_key", sort=False):
+    # Group by protein_key + key_mutation
+    for (protein_key, key_mutation), gdf in df.groupby(["protein_key","key_mutation"], sort=False):
         try:
             process_group(gdf, protein_key, args.out_dir, summary_rows)
         except Exception as e:
-            # emit a failed summary line per group (no saved_pdb_id)
-            extra = {}
-            if "protein" in gdf.columns: extra["protein"]=gdf.iloc[0].get("protein","")
-            if "ligand"  in gdf.columns: extra["ligand"]=gdf.iloc[0].get("ligand","")
-            if "sequence" in gdf.columns: extra["sequence"]=gdf.iloc[0].get("sequence","")
-            if "key_mutation" in gdf.columns: extra["key_mutation"]=gdf.iloc[0].get("key_mutation","")
             summary_rows.append({
                 "protein_key": protein_key,
-                "target_type": "mixed",
-                "protein": extra.get("protein",""),
-                "ligand": extra.get("ligand",""),
-                "sequence": extra.get("sequence",""),
-                "key_mutation": extra.get("key_mutation",""),
-                "saved_target_pdb_id": "",
-                "saved_off_target_pdb_id": "",
-                "saved_target_ligand_id": "",
-                "saved_off_target_ligand_id": "",
-                "off_target_pdb_created": "no",
-                "placement_basis": "failed",
-                "saved_pdb_id": "",
+                "key_mutation": key_mutation,
+                "status": "error",
+                "message": str(e),
+                "output_file": ""
             })
-            print(f"[ERROR] {protein_key}: {e}", file=sys.stderr)
+            print(f"[ERROR] {protein_key}_{key_mutation}: {e}", file=sys.stderr)
             traceback.print_exc()
 
     out_summary = os.path.join(args.out_dir, "summary.csv")
