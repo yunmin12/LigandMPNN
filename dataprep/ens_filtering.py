@@ -85,7 +85,7 @@ def main():
     p.add_argument("--base_dir", required=True)
     p.add_argument("--type", choices=["tar", "off"], required=True)
     p.add_argument("--mode", choices=["self", "cross"], required=True)
-    p.add_argument("--method", choices=["filter", "rank"], default="rank")
+    # p.add_argument("--method", choices=["filter", "rank"], default="rank")
     p.add_argument("--topk", type=int, default=None)
     args = p.parse_args()
 
@@ -108,7 +108,7 @@ def main():
     summary_rows = []
     USECOLS = ["rmsd","prmsd","plddt","plddt_pde","kabsch"]
     is_self = (args.mode == 'self')
-    is_rank = (args.method == 'rank')
+    # is_rank = (args.method == 'rank')
     topk = args.topk if args.topk is not None else (15 if is_self else 30)
 
     subdirs = sorted([d for d in glob.glob(os.path.join(args.base_dir, "*"))])
@@ -142,9 +142,9 @@ def main():
             filtered_df.to_csv(filter_path, index=False)
             print(f"[{args.type}][{args.mode}] {os.path.basename(file)} ({len(filtered_df)}/{len(df)})")
 
-            if is_rank:
-                rank_df = rank_topk_self(df, topk=topk) if is_self else rank_topk_cross(df, topk=topk)
-                ranked_indices = rank_df.index.to_list()
+            # if is_rank:
+            rank_df = rank_topk_self(df, topk=topk) if is_self else rank_topk_cross(df, topk=topk)
+            ranked_indices = rank_df.index.to_list()
             rank_path = os.path.join(filter_dir, stem + "_ranked.csv")
             rank_df.to_csv(rank_path, index=False, float_format="%.4f")
 
