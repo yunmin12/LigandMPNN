@@ -188,17 +188,17 @@ def process_group(gdf: pd.DataFrame, protein_key: str, out_dir: str, summary_row
     off_pdb_ids: Set[str]    = set()
     for r in rows:
         ttype = norm_ttype(r.get("target_type",""))
+        is_off = (ttype == "off_target")
         cids = [p.strip().upper() for p in re.split(r"[,\s]+", str(r["complex_pdb_id"]).strip()) if p.strip()]
         for pid in cids:
-            path = os.path.join(complex_dir, f"{pid}.pdb")
+            subdir = "off" if is_off else "target"
+            path = os.path.join(complex_dir, subdir, f"{pid}.pdb")
             if os.path.exists(path):
-                if ttype == "off_target": off_pdb_ids.add(pid)
-                else: target_pdb_ids.add(pid)
+                (off_pdb_ids if is_off else target_pdb_ids).add(pid)
                 continue
             ok = download_pdb(pid, path)
             if ok:
-                if ttype == "off_target": off_pdb_ids.add(pid)
-                else: target_pdb_ids.add(pid)
+                (off_pdb_ids if is_off else target_pdb_ids).add(pid)
 
     # Generate and save the ligand PDBs (ligands/target or off/{ligand_id}.pdb)
     row_lig_blocks: Dict[int, str] = {}
@@ -253,7 +253,7 @@ def process_group(gdf: pd.DataFrame, protein_key: str, out_dir: str, summary_row
 
     # ---------- Only when target complex PDB exists ----------
     for basis_id in sorted(target_pdb_ids):
-        basis_path = os.path.join(complex_dir, f"{basis_id}.pdb")
+        basis_path = os.path.join(complex_dir, "target", f"{basis_id}.pdb")
         if not os.path.exists(basis_path):
             warn(basis_id, "", "Basis PDB not found on disk.")
             continue
