@@ -358,7 +358,7 @@ def main():
             print(f"[ERROR] {protein_key}_{key_mutation}: {e}", file=sys.stderr)
             traceback.print_exc()
 
-    out_summary = os.path.join(args.out_dir, "summary.csv")
+    out_summary = os.path.join(args.out_dir, "bindingdb_summary.csv")
     pd.DataFrame(summary_rows).to_csv(out_summary, index=False)
     print(f"✅ Summary saved: {out_summary}")
 
