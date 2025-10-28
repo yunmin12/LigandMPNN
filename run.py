@@ -440,48 +440,65 @@ def main(args) -> None:
                 ofd["symmetry_weights"]  = feature_dict["symmetry_weights"]
                 return ofd
 
-            def _logit_pass(fd: dict) -> list:
+            def _logit_pass(fd: dict) -> torch.Tensor:
                 fdc = copy.deepcopy(fd)
                 fdc["batch_size"] = 1
                 fdc["randn"] = torch.zeros([1, fdc["mask"].shape[1]], device=device)
                 fdc.pop("external_logits_override", None)
                 fdc.pop("external_logit_bias", None)
+                fdc["temperature"] = 1.0
                 out = model.sample(fdc)
-                # out["logits"]: [L, 21] (before bias/override/temperature)
-                # out["logits_step"]: [L, 21] (after external/bias)
-                # out["logits_temp"]: [L, 21] (after temperature, before softmax)
-                return out["logits_step"].to(device)   # [L,21]
-                
+                # ★ raw logits 사용 (bias/override 전)
+                # out["logits"]: [L,21], out["logits_step"]: [L,21] (external/bias 적용 후)
+                return out["logits"].to(device)  # [L,21]
+
             if args.negative_enable and args.offtarget_pdb_path and len(args.offtarget_pdb_path) > 0:
                 # 1) target prepass
                 target_fd_pp = copy.deepcopy(feature_dict)
                 target_fd_pp["batch_size"] = 1
-                target_fd_pp["temperature"] = args.temperature
+                target_fd_pp["temperature"] = 1.0
                 target_fd_pp["randn"] = torch.zeros([1, target_fd_pp["mask"].shape[1]], device=device)
                 target_fd_pp.pop("external_logits_override", None)
                 target_fd_pp.pop("external_logit_bias", None)
-                t_logp = _logit_pass(target_fd_pp)  # [L,21]
+                t_logit = _logit_pass(target_fd_pp)  # [L,21] (raw)
 
-                # 2) off-target prepass
+                # 2) off-target prepass (average raw logits)
                 off_logp_list = []
                 for off_p in args.offtarget_pdb_path:
                     ofd = _make_off_feature_dict(off_p)
+                    ofd["batch_size"] = 1
+                    ofd["temperature"] = 1.0
                     ofd["randn"] = torch.zeros([1, ofd["mask"].shape[1]], device=device)
-                    off_logp_list.append(_logit_pass(ofd))  # [L,21]
-                
-                # 3) contrastive fused logits
+                    off_logp_list.append(_logit_pass(ofd))  # [L,21] (raw)
+
+                # 3) hand the average of off-target to model_utils for contrastive logits tuning
                 if off_logp_list:
-                    offs = torch.stack(off_logp_list, 0)
-                    off_mean = offs.mean(0)  # [B-1,L,21] -> [L,21]
-                    lam = float(args.negative_weight)
-                    fused_logit_like = t_logp + lam * (t_logp - off_mean)  # [L,21]
-                    feature_dict["external_logits_override"] = fused_logit_like.unsqueeze(0)
+                    offs = torch.stack(off_logp_list, 0)   # [K, L, 21]
+                    off_mean = offs.mean(0)                # [L, 21]
+                    feature_dict["external_logits_override"] = off_mean.unsqueeze(0)  # [1, L, 21]
                     feature_dict["temperature"] = args.temperature
 
-                    feature_dict["_contrastive_debug"] = {
-                        "per_ligand_logits_step": torch.cat([t_logp.unsqueeze(0), offs], dim=0).detach().cpu(),
-                        "fused_logits_step": fused_logit_like.detach().cpu(),
-                    }
+                    # contrastive tuning parameters (>>> model_utils.py)
+                    feature_dict["negative_enable"] = int(args.negative_enable)
+                    feature_dict["negative_weight"] = float(args.negative_weight)
+
+                    # negative_residues parsing: "10 25 47" → [1, L] mask (suppose batch_size=1)
+                    neg_res_mask = None
+                    if getattr(args, "negative_residues", ""):
+                        L = feature_dict["mask"].shape[1]
+                        idxs = []
+                        for tok in str(args.negative_residues).strip().split():
+                            try:
+                                idx = int(tok)
+                                if 0 <= idx < L:
+                                    idxs.append(idx)
+                            except:
+                                pass
+                        if idxs:
+                            neg_res_mask = torch.zeros((1, L), dtype=torch.float32, device=device)
+                            neg_res_mask[:, idxs] = 1.0
+                    if neg_res_mask is not None:
+                        feature_dict["negative_residues"] = neg_res_mask  # [1, L]
 
             sampling_probs_list = []
             log_probs_list = []
@@ -824,31 +841,36 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--checkpoint_protein_mpnn",
         type=str,
-        default="./model_params/proteinmpnn_v_48_020.pt",
+        # default="./model_params/proteinmpnn_v_48_020.pt",
+        default="/home/yunmin/proj/LigandMPNN/model_params/proteinmpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_ligand_mpnn",
         type=str,
-        default="./model_params/ligandmpnn_v_32_010_25.pt",
+        # default="./model_params/ligandmpnn_v_32_010_25.pt",
+        default="/home/yunmin/proj/LigandMPNN/model_params/ligandmpnn_v_32_010_25.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_per_residue_label_membrane_mpnn",
         type=str,
+        # default="./model_params/per_residue_label_membrane_mpnn_v_48_020.pt",
         default="./model_params/per_residue_label_membrane_mpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_global_label_membrane_mpnn",
         type=str,
-        default="./model_params/global_label_membrane_mpnn_v_48_020.pt",
+        # default="./model_params/global_label_membrane_mpnn_v_48_020.pt",
+        default="/home/yunmin/proj/LigandMPNN/model_params/global_label_membrane_mpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_soluble_mpnn",
         type=str,
-        default="./model_params/solublempnn_v_48_020.pt",
+        # default="./model_params/solublempnn_v_48_020.pt",
+        default="/home/yunmin/proj/LigandMPNN/model_params/solublempnn_v_48_020.pt",
         help="Path to model weights.",
     )
 
@@ -1138,21 +1160,7 @@ if __name__ == "__main__":
         default=1.0,
         help="Weight for off-target penalty (alpha).",
     )
-
-    # argparser.add_argument(
-    #     "--negative_agg", 
-    #     choices=["mean", "max"], 
-    #     default="mean",
-    #     help="Aggregate multiple off-target logits by mean or max.",
-    # )
-
-    # argparser.add_argument(
-    #     "--negative_apply", 
-    #     choices=["logits", "log_probs"],
-    #     default="logits",
-    #     help="Substraction by logits or log_probs.",
-    # )
-
+    
     argparser.add_argument(
         "--negative_residues",
         type=str,

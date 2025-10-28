@@ -316,28 +316,86 @@ class ProteinMPNN(torch.nn.Module):
                 logits_step = logits + bias_t
                 # log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # [B,21]
 
-                # external override and bias for logit-based negative design
-                external_override = feature_dict.get("external_logits_override", None)  # [B,21] or [B,L,21]
+                # === external override and bias for logit-based negative design ===
+                def slice_step(x, t):
+                    """
+                    x: [B,21] or [B,L,21] or [B,1,21]
+                    t: [B] long in [0, L)
+                    return: [B,21]
+                    """
+                    if x is None:
+                        return None
+                    if x.dim() == 2:  # [B,21]
+                        return x
+                    if x.dim() == 3:
+                        B, Ls, C = x.shape
+                        assert C == 21, f"expected C=21, got {C}"
+                        if t.dtype != torch.long:
+                            t = t.long()
+                        if Ls == 1:  # [B,1,21] -> squeeze
+                            return x[:, 0, :]
+                        assert (t >= 0).all() and (t < Ls).all(), f"t out of range: max={int(t.max())} >= L={Ls}"
+                        return torch.gather(x, 1, t[:, None, None].expand(B, 1, C))[:, 0]
+                    raise ValueError(f"unsupported dim {x.dim()} for external tensor")
+
+                def norm_off_logits(off_step, tau_off=1.0):
+                    z = torch.nn.functional.log_softmax(off_step / tau_off, dim=-1)  # [B,21]
+                    return z - z.mean(dim=-1, keepdim=True)  # [B,21]
+
+                # ---- external override / bias (contrastive) ----
+                external_override = feature_dict.get("external_logits_override", None)
                 external_bias = feature_dict.get("external_logit_bias", None)
 
-                if external_override is not None:
-                    if external_override.dim() == 3:
-                        external_override = torch.gather(external_override, 1, t[:, None, None].repeat(1, 1, external_override.size(-1)))[:, 0]
-                    logits_step = external_override
-                elif external_bias is not None:
-                    if external_bias.dim() == 3:
-                        external_bias = torch.gather(external_bias, 1, t[:, None, None].repeat(1, 1, external_bias.size(-1)))[:, 0]
-                    logits_step = logits_step + external_bias
-                
+                negative_enable = int(feature_dict.get("negative_enable", 1))
+                alpha = float(feature_dict.get("negative_weight", 0.2))
+                tau_off = 1.0
+
+                # negative_residues: (i) [B,L] mask ∈ {0,1}, (ii) 1D index list, (iii) None
+                neg_res = feature_dict.get("negative_residues", None)
+                apply_contrast = torch.ones((B,), dtype=torch.bool, device=device)
+
+                if neg_res is not None:
+                    if torch.is_tensor(neg_res):
+                        if neg_res.dim() == 2 and neg_res.shape == (B, L):
+                            apply_contrast = torch.gather(neg_res, 1, t[:, None])[:, 0] > 0
+                        elif neg_res.dim() == 1:
+                            idx_set = set(neg_res.tolist())
+                            apply_contrast = torch.tensor([(int(tt.item()) in idx_set) for tt in t],
+                                                        device=device, dtype=torch.bool)
+                        else:
+                            apply_contrast = torch.zeros((B,), dtype=torch.bool, device=device)
+                    else:
+                        apply_contrast = torch.zeros((B,), dtype=torch.bool, device=device)
+
+                # 1) contrastive: logits_tar - alpha * normalize(logits_off)
+                if negative_enable and (external_override is not None) and (alpha > 0.0):
+                    ext_step = slice_step(external_override, t)  # [B,21]
+                    ext_step = norm_off_logits(ext_step, tau_off=tau_off)  # [B,21]
+                    contrast = alpha * ext_step  # [B,21]
+
+                    if apply_contrast.all():
+                        logits_step = logits_step - contrast
+                    elif (~apply_contrast).all():
+                        pass
+                    else:
+                        logits_step = torch.where(apply_contrast[:, None], logits_step - contrast, logits_step)
+
+                # 2) add bias
+                if external_bias is not None:
+                    eb = slice_step(external_bias, t)  # [B,21]
+                    assert eb.shape == logits_step.shape
+                    logits_step = logits_step + eb
+
+                # sampling
                 logits_temp = logits_step / temperature
                 log_probs = torch.nn.functional.log_softmax(logits_temp, dim=-1)  # [B,21]
                 probs = torch.nn.functional.softmax(
                 #     (logits + bias_t) / temperature, dim=-1
                     logits_temp, dim=-1
                 )  # [B,21]
-                probs_sample = probs[:, :20] / torch.sum(
+                probs_sample = probs[:, :20] / (torch.sum(
                     probs[:, :20], dim=-1, keepdim=True
-                )  # hard omit X #[B,20]
+                ) + 1e-9)  # except X, prevent underflow
                 S_t = torch.multinomial(probs_sample, 1)[:, 0]  # [B]
 
                 all_probs.scatter_(
