@@ -148,6 +148,8 @@ def process_group(gdf: pd.DataFrame, protein_key: str, out_dir: str, summary_row
     safe_root = f"{safe_name(base_key)}_{safe_name(mut_part)}"
     pdir = os.path.join(out_dir, safe_root); mkdir(pdir)
     complex_dir  = os.path.join(pdir, "complex");  mkdir(complex_dir)
+    complex_tar = os.path.join(complex_dir, "pdb_tar");  mkdir(complex_tar)
+    complex_off = os.path.join(complex_dir, "pdb_off");  mkdir(complex_off)
     standard_dir = os.path.join(pdir, "standard"); mkdir(standard_dir)
     ligands_dir  = os.path.join(pdir, "ligands");  mkdir(ligands_dir)
     lig_target   = os.path.join(ligands_dir, "target"); mkdir(lig_target)
@@ -191,7 +193,7 @@ def process_group(gdf: pd.DataFrame, protein_key: str, out_dir: str, summary_row
         is_off = (ttype == "off_target")
         cids = [p.strip().upper() for p in re.split(r"[,\s]+", str(r["complex_pdb_id"]).strip()) if p.strip()]
         for pid in cids:
-            subdir = "off" if is_off else "target"
+            subdir = complex_off if is_off else complex_tar
             path = os.path.join(complex_dir, subdir, f"{pid}.pdb")
             if os.path.exists(path):
                 (off_pdb_ids if is_off else target_pdb_ids).add(pid)
