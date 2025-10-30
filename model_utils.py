@@ -249,6 +249,9 @@ class ProteinMPNN(torch.nn.Module):
             all_log_probs = torch.zeros(
                 (B_decoder, L, 21), device=device, dtype=torch.float32
             )
+            all_logits = torch.zeros(
+                (B_decoder, L, 21), device=device, dtype=torch.float32
+            )
             h_S = torch.zeros_like(h_V, device=device)
             S = 20 * torch.ones((B_decoder, L), dtype=torch.int64, device=device)
             h_V_stack = [h_V] + [
@@ -313,6 +316,11 @@ class ProteinMPNN(torch.nn.Module):
                     t[:, None, None].repeat(1, 1, h_V_stack[-1].shape[-1]),
                 )[:, 0]
                 logits = self.W_out(h_V_t)  # [B,21]
+                all_logits.scatter_(
+                    1, 
+                    t[:, None, None].repeat(1, 1, 21), 
+                    (chain_mask_t[:, None, None] * logits[:, None, :]).float(),
+                )
                 logits_step = logits + bias_t
                 # log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # [B,21]
 
@@ -417,6 +425,14 @@ class ProteinMPNN(torch.nn.Module):
                 )
                 S.scatter_(1, t[:, None], S_t[:, None])
 
+            # prepare for saving results
+            off_logits = None
+            if isinstance(external_override, torch.Tensor):
+                off_logits = external_override.detach()
+            ext_bias_save = None
+            if isinstance(external_bias, torch.Tensor):
+                ext_bias_save = external_bias.detach()
+            
             output_dict = {
                 "S": S,
                 "sampling_probs": all_probs,
@@ -426,7 +442,15 @@ class ProteinMPNN(torch.nn.Module):
                 "logits": logits.detach(),
                 "logits_step": logits_step.detach(),
                 "logits_temp": logits_temp.detach(),
+                "logits_all": all_logits.detach(), 
+                # off-target logits, bias, mask, params
+                "off_logits": off_logits, 
+                "external_bias": ext_bias_save,
+                "negative_residues": feature_dict.get("negative_residues", None),
+                "negative_weight": torch.as_tensor(alpha).detach(),
+                "temperature": torch.as_tensor(temperature).detach(),
             }
+        ### symmetry weights 부분도 동일하게 수정하기
         else:
             # weights for symmetric design
             symmetry_weights = torch.ones([L], device=device, dtype=torch.float32)
