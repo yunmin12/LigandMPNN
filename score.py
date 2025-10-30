@@ -312,6 +312,97 @@ def main(args) -> None:
             out_dict["alphabet"] = alphabet
             out_dict["residue_names"] = encoded_residue_dict_rev
 
+            # off-target logits, bias, settings
+            if "external_logits_override" in feature_dict:
+                out_dict["off_logits_mean"] = feature_dict["external_logits_override"][0].detach().cpu().numpy()  # [1, L, 21] -> [L, 21]
+
+            if "external_logit_bias" in feature_dict and isinstance(feature_dict["external_logit_bias"], torch.Tensor):
+                out_dict["external_bias"] = feature_dict["external_logit_bias"][0].detach().cpu().numpy() \
+                    if feature_dict["external_logit_bias"].dim() == 3 else feature_dict["external_logit_bias"].detach().cpu().numpy()
+
+            if "negative_residues" in feature_dict and isinstance(feature_dict["negative_residues"], torch.Tensor):
+                out_dict["negative_residues"] = feature_dict["negative_residues"][0].detach().cpu().numpy() \
+                    if feature_dict["negative_residues"].dim() == 2 else feature_dict["negative_residues"].detach().cpu().numpy()
+
+            out_dict["temperature_run"] = float(feature_dict.get("temperature", 1.0))
+            out_dict["negative_weight"] = float(feature_dict.get("negative_weight", getattr(args, "negative_weight", 0.0)))
+            
+            import copy
+
+            def _logit_pass(fd: dict) -> torch.Tensor:
+                fdc = copy.deepcopy(fd)
+                fdc["batch_size"] = 1
+                fdc["temperature"] = 1.0
+                fdc["randn"] = torch.zeros([1, fdc["mask"].shape[1]], device=device)
+                fdc.pop("external_logits_override", None)
+                fdc.pop("external_logit_bias", None)
+                if "symmetry_residues" not in fdc:
+                    fdc["symmetry_residues"] = []
+                if "symmetry_weights" not in fdc:
+                    fdc["symmetry_weights"]  = []
+                if "bias" not in fdc:
+                    L_here = fdc["mask"].shape[1]
+                    fdc["bias"] = torch.zeros((1, L_here, 21), dtype=torch.float32, device=device)
+                out = model.sample(fdc)
+                return out["logits_all"][0].to(device)  # [L,21]
+
+            if len(args.parse_these_chains_only) != 0:
+                parse_these_chains_only_list = args.parse_these_chains_only.split(",")
+            else:
+                parse_these_chains_only_list = []
+            
+            def _make_off_feature_dict(off_pdb_path: str) -> dict:
+                # Parse and featurize off-target PDB(s)
+                off_protein_dict, _, _, off_icodes, _ = parse_PDB(
+                    off_pdb_path,
+                    device=device,
+                    chains=parse_these_chains_only_list,
+                    parse_all_atoms=1,
+                    parse_atoms_with_zero_occupancy=args.parse_atoms_with_zero_occupancy,
+                )
+                if off_protein_dict["R_idx"].shape != protein_dict["R_idx"].shape:
+                    raise RuntimeError("R_idx length mismatch between target and off-target.")
+                for k in ["chain_mask", "membrane_per_residue_labels"]:
+                    if k in protein_dict:
+                        off_protein_dict[k] = protein_dict[k]
+                ofd = featurize(
+                    off_protein_dict,
+                    cutoff_for_score=args.ligand_mpnn_cutoff_for_score,
+                    use_atom_context=args.ligand_mpnn_use_atom_context,
+                    number_of_ligand_atoms=atom_context_num,
+                    model_type=args.model_type,
+                )
+                L_off = ofd["X"].shape[1]
+                assert L_off == L, "Off-target length mismatch"
+                
+                ofd["batch_size"] = 1
+                ofd["temperature"] = 1.0
+                bias = feature_dict.get("bias", None)
+                ofd["randn"] = torch.zeros([1, ofd["mask"].shape[1]], device=device)
+                if isinstance(bias, torch.Tensor):
+                    ofd["bias"] = bias.detach().clone()[:1]  # [1, L, 21]
+                else:
+                    ofd["bias"] = torch.zeros((1, L, 21), dtype=torch.float32, device=device)
+                if "symmetry_residues" in feature_dict:
+                    ofd["symmetry_residues"] = feature_dict["symmetry_residues"]
+                if "symmetry_weights" in feature_dict:
+                    ofd["symmetry_weights"] = feature_dict["symmetry_weights"]
+                return ofd
+            
+            off_mean = None
+            if args.offtarget_pdb_path and len(args.offtarget_pdb_path) > 0:
+                off_paths = args.offtarget_pdb_path if isinstance(args.offtarget_pdb_path, (list, tuple)) else [args.offtarget_pdb_path]
+                off_list = []
+                for off_p in args.offtarget_pdb_path:
+                    ofd = _make_off_feature_dict(off_p)
+                    off_list.append(_logit_pass(ofd))   # [L,21]
+                if off_list:
+                    offs = torch.stack(off_list, 0)
+                    off_mean = offs.mean(0)  # [L,21]
+
+            if off_mean is not None:
+                out_dict["off_logits_mean"] = off_mean.detach().cpu().numpy()
+            
             mean_probs = np.mean(out_dict["probs"], 0)
             std_probs = np.std(out_dict["probs"], 0)
             sequence = [restype_int_to_str[AA] for AA in out_dict["native_sequence"]]
@@ -414,31 +505,36 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--checkpoint_protein_mpnn",
         type=str,
-        default="./model_params/proteinmpnn_v_48_020.pt",
+        # default="./model_params/proteinmpnn_v_48_020.pt",
+        default="/home/yunmin/proj/LigandMPNN/model_params/proteinmpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_ligand_mpnn",
         type=str,
-        default="./model_params/ligandmpnn_v_32_010_25.pt",
+        # default="./model_params/ligandmpnn_v_32_010_25.pt",
+        default="/home/yunmin/proj/LigandMPNN/model_params/ligandmpnn_v_32_010_25.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_per_residue_label_membrane_mpnn",
         type=str,
-        default="./model_params/per_residue_label_membrane_mpnn_v_48_020.pt",
+        # default="./model_params/per_residue_label_membrane_mpnn_v_48_020.pt",
+        default="/home/yunmin/proj/LigandMPNN/model_params/per_residue_label_membrane_mpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_global_label_membrane_mpnn",
         type=str,
-        default="./model_params/global_label_membrane_mpnn_v_48_020.pt",
+        # default="./model_params/global_label_membrane_mpnn_v_48_020.pt",
+        default="/home/yunmin/proj/LigandMPNN/model_params/global_label_membrane_mpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_soluble_mpnn",
         type=str,
-        default="./model_params/solublempnn_v_48_020.pt",
+        # default="./model_params/solublempnn_v_48_020.pt",
+        default="/home/yunmin/proj/LigandMPNN/model_params/solublempnn_v_48_020.pt",
         help="Path to model weights.",
     )
 
@@ -610,5 +706,17 @@ if __name__ == "__main__":
         help="1 - run single amino acid scoring function; p(AA_i|backbone, AA_{all except ith one}), 0 - False",
     )
 
+    argparser.add_argument(
+        "--offtarget_pdb_path", 
+        action="append",
+        default=None,
+        help="Repeatable. PDB(s) for off-target ligand contexts. Same backbone/sequence indexing expected.",
+    )
+
+    argparser.add_argument(
+        "--temperature", type=float, default=1.0,
+        help="Sampling temperature for score forward pass (default: 1.0)"
+    )
+    
     args = argparser.parse_args()
     main(args)
