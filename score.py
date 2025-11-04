@@ -328,7 +328,7 @@ def main(args) -> None:
             out_dict["negative_weight"] = float(feature_dict.get("negative_weight", getattr(args, "negative_weight", 0.0)))
             
             import copy
-
+            
             def _logit_pass(fd: dict) -> torch.Tensor:
                 fdc = copy.deepcopy(fd)
                 fdc["batch_size"] = 1
@@ -399,6 +399,56 @@ def main(args) -> None:
                 if off_list:
                     offs = torch.stack(off_list, 0)
                     off_mean = offs.mean(0)  # [L,21]
+
+            if off_mean is not None and args.negative_enable:
+                feature_dict["external_logits_override"] = off_mean.unsqueeze(0)  # [1,L,21]
+                feature_dict["negative_enable"] = int(args.negative_enable)
+                feature_dict["negative_weight"] = float(args.negative_weight)
+                if getattr(args, "negative_tau_off", None) is not None:
+                    feature_dict["negative_tau_off"] = float(args.negative_tau_off)
+                if getattr(args, "negative_residues", ""):
+                    L_here = feature_dict["mask"].shape[1]
+                    idxs = []
+                    for tok in str(args.negative_residues).split():
+                        try:
+                            i = int(tok)
+                            if 0 <= i < L_here:
+                                idxs.append(i)
+                        except:
+                            pass
+                    if idxs:
+                        m = torch.zeros((1, L_here), dtype=torch.float32, device=device)
+                        m[:, idxs] = 1.0
+                        feature_dict["negative_residues"] = m
+            else:
+                feature_dict.pop("external_logits_override", None)
+                feature_dict["negative_enable"] = 0
+
+
+            device = feature_dict["mask"].device
+            B = int(feature_dict.get("batch_size", 1))
+            L = int(feature_dict["mask"].shape[1])
+            feature_dict["batch_size"] = B
+
+            # Ensuring
+            if "bias" not in feature_dict or not isinstance(feature_dict["bias"], torch.Tensor):
+                feature_dict["bias"] = torch.zeros((B, L, 21), dtype=torch.float32, device=device)
+            else:
+                if feature_dict["bias"].dim() == 3 and feature_dict["bias"].shape[0] != B:
+                    feature_dict["bias"] = feature_dict["bias"][:1].repeat(B, 1, 1)
+            if "chain_mask" not in feature_dict or not isinstance(feature_dict["chain_mask"], torch.Tensor):
+                feature_dict["chain_mask"] = torch.ones((B, L), dtype=torch.float32, device=device)
+            feature_dict.setdefault("symmetry_residues", [])
+            feature_dict.setdefault("symmetry_weights", [])
+            feature_dict["temperature"] = float(getattr(args, "temperature", 1.0))
+            if "randn" not in feature_dict or not isinstance(feature_dict["randn"], torch.Tensor) \
+            or feature_dict["randn"].shape != (B, L):
+                feature_dict["randn"] = torch.zeros((B, L), device=device)
+            if "external_logits_override" not in feature_dict:
+                feature_dict["negative_enable"] = 0
+
+            out = model.sample(feature_dict)
+            out_dict["probs"] = out["sampling_probs"].detach().cpu().numpy()
 
             if off_mean is not None:
                 out_dict["off_logits_mean"] = off_mean.detach().cpu().numpy()
@@ -716,6 +766,10 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--temperature", type=float, default=1.0,
         help="Sampling temperature for score forward pass (default: 1.0)"
+    )
+
+    argparser.add_argument(
+        "--negative_tau_off", type=float, default=1.0,
     )
     
     args = argparser.parse_args()
