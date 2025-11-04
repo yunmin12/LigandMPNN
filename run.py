@@ -448,7 +448,7 @@ def main(args) -> None:
                 fdc.pop("external_logit_bias", None)
                 fdc["temperature"] = 1.0
                 out = model.sample(fdc)
-                # ★ raw logits 사용 (bias/override 전)
+                # raw logits 사용 (bias/override 전)
                 # out["logits"]: [L,21], out["logits_step"]: [L,21] (external/bias 적용 후)
                 return out["logits"].to(device)  # [L,21]
 
@@ -856,7 +856,7 @@ if __name__ == "__main__":
         "--checkpoint_per_residue_label_membrane_mpnn",
         type=str,
         # default="./model_params/per_residue_label_membrane_mpnn_v_48_020.pt",
-        default="./model_params/per_residue_label_membrane_mpnn_v_48_020.pt",
+        default="/home/yunmin/proj/LigandMPNN/model_params/per_residue_label_membrane_mpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
@@ -1086,7 +1086,7 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--checkpoint_path_sc",
         type=str,
-        default="./model_params/ligandmpnn_sc_v_32_002_16.pt",
+        default="/home/yunmin/proj/LigandMPNN/model_params/ligandmpnn_sc_v_32_002_16.pt",
         help="Path to model weights.",
     )
 
