@@ -178,49 +178,168 @@ class ProteinMPNN(torch.nn.Module):
         return h_V, h_E, E_idx
 
     def sample(self, feature_dict):
-        # xyz_37 = feature_dict["xyz_37"] #[B,L,37,3] - xyz coordinates for all atoms if needed
-        # xyz_37_m = feature_dict["xyz_37_m"] #[B,L,37] - mask for all coords
-        # Y = feature_dict["Y"] #[B,L,num_context_atoms,3] - for ligandMPNN coords
-        # Y_t = feature_dict["Y_t"] #[B,L,num_context_atoms] - element type
-        # Y_m = feature_dict["Y_m"] #[B,L,num_context_atoms] - mask
-        # X = feature_dict["X"] #[B,L,4,3] - backbone xyz coordinates for N,CA,C,O
         B_decoder = feature_dict["batch_size"]
-        S_true = feature_dict[
-            "S"
-        ]  # [B,L] - integer proitein sequence encoded using "restype_STRtoINT"
-        # R_idx = feature_dict["R_idx"] #[B,L] - primary sequence residue index
-        mask = feature_dict[
-            "mask"
-        ]  # [B,L] - mask for missing regions - should be removed! all ones most of the time
-        chain_mask = feature_dict[
-            "chain_mask"
-        ]  # [B,L] - mask for which residues need to be fixed; 0.0 - fixed; 1.0 - will be designed
-        bias = feature_dict["bias"]  # [B,L,21] - amino acid bias per position
-        # chain_labels = feature_dict["chain_labels"] #[B,L] - integer labels for chain letters
-        randn = feature_dict[
-            "randn"
-        ]  # [B,L] - random numbers for decoding order; only the first entry is used since decoding within a batch needs to match for symmetry
-        temperature = feature_dict[
-            "temperature"
-        ]  # float - sampling temperature; prob = softmax(logits/temperature)
-        symmetry_list_of_lists = feature_dict[
-            "symmetry_residues"
-        ]  # [[0, 1, 14], [10,11,14,15], [20, 21]] #indices to select X over length - L
-        symmetry_weights_list_of_lists = feature_dict[
-            "symmetry_weights"
-        ]  # [[1.0, 1.0, 1.0], [-2.0,1.1,0.2,1.1], [2.3, 1.1]]
+        S_true = feature_dict["S"]
+        mask = feature_dict["mask"]
+        chain_mask = feature_dict["chain_mask"]
+        bias = feature_dict["bias"]
+        randn = feature_dict["randn"]
+        temperature = feature_dict["temperature"]
+        symmetry_list_of_lists = feature_dict["symmetry_residues"]
+        symmetry_weights_list_of_lists = feature_dict["symmetry_weights"]
 
         B, L = S_true.shape
         device = S_true.device
 
-        h_V, h_E, E_idx = self.encode(feature_dict)
+        off_target_feature_dicts = feature_dict.get("off_target_features") or []
+        target_weight = float(feature_dict.get("target_weight", 1.0))
+        off_target_weight = float(feature_dict.get("off_target_weight", 1.0))
+        penalty_mask = feature_dict.get("off_target_residue_mask")
+        if penalty_mask is not None and torch.is_tensor(penalty_mask):
+            penalty_mask = penalty_mask.to(device=device, dtype=torch.float32)
+        combine_off = len(off_target_feature_dicts) > 0 and abs(off_target_weight) > 0.0
 
-        chain_mask = mask * chain_mask  # update chain_M to include missing regions
+        h_V, h_E, E_idx = self.encode(feature_dict)
+        off_encodings = []
+        if combine_off:
+            for off_fd in off_target_feature_dicts:
+                off_h_V, off_h_E, off_E_idx = self.encode(off_fd)
+                off_encodings.append((off_fd, off_h_V, off_h_E, off_E_idx))
+
+        def _prepare_context(fd, h_V_base, h_E_base, E_idx_base, order_mask_backward_expanded):
+            repeat_factor = B_decoder
+            E_idx_ctx = E_idx_base.repeat(repeat_factor, 1, 1)
+            mask_ctx = fd["mask"].repeat(repeat_factor, 1)
+            chain_mask_ctx = (fd["mask"] * fd["chain_mask"]).repeat(repeat_factor, 1)
+            bias_ctx = fd["bias"].repeat(repeat_factor, 1, 1)
+
+            mask_attend_ctx = torch.gather(
+                order_mask_backward_expanded, 2, E_idx_ctx
+            ).unsqueeze(-1)
+            mask_1D_ctx = mask_ctx.view(mask_ctx.shape[0], L, 1, 1)
+            mask_bw_ctx = mask_1D_ctx * mask_attend_ctx
+            mask_fw_ctx = mask_1D_ctx * (1.0 - mask_attend_ctx)
+
+            h_V_ctx = h_V_base.repeat(repeat_factor, 1, 1)
+            h_E_ctx = h_E_base.repeat(repeat_factor, 1, 1, 1)
+            h_S_ctx = torch.zeros_like(h_V_ctx, device=device)
+            h_V_stack_ctx = [h_V_ctx] + [
+                torch.zeros_like(h_V_ctx, device=device)
+                for _ in range(len(self.decoder_layers))
+            ]
+
+            h_EX_encoder_ctx = cat_neighbors_nodes(
+                torch.zeros_like(h_S_ctx), h_E_ctx, E_idx_ctx
+            )
+            h_EXV_encoder_ctx = cat_neighbors_nodes(
+                h_V_ctx, h_EX_encoder_ctx, E_idx_ctx
+            )
+            h_EXV_encoder_fw_ctx = mask_fw_ctx * h_EXV_encoder_ctx
+
+            return {
+                "E_idx": E_idx_ctx,
+                "h_E": h_E_ctx,
+                "mask": mask_ctx,
+                "mask_bw": mask_bw_ctx,
+                "h_EXV_encoder_fw": h_EXV_encoder_fw_ctx,
+                "h_V_stack": h_V_stack_ctx,
+                "h_S": h_S_ctx,
+                "S": 20 * torch.ones((h_V_ctx.shape[0], L), dtype=torch.int64, device=device),
+                "chain_mask": chain_mask_ctx,
+                "bias": bias_ctx,
+                "S_true": fd["S"].repeat(repeat_factor, 1),
+            }
+
+        def _context_step_logits(ctx, positions):
+            positions_idx = positions.view(-1).long()
+            E_idx_t = torch.gather(
+                ctx["E_idx"],
+                1,
+                positions_idx[:, None, None].repeat(
+                    1, 1, ctx["E_idx"].shape[-1]
+                ),
+            )
+            h_E_t = torch.gather(
+                ctx["h_E"],
+                1,
+                positions_idx[:, None, None, None].repeat(
+                    1, 1, ctx["h_E"].shape[-2], ctx["h_E"].shape[-1]
+                ),
+            )
+            h_ES_t = cat_neighbors_nodes(ctx["h_S"], h_E_t, E_idx_t)
+            h_EXV_encoder_t = torch.gather(
+                ctx["h_EXV_encoder_fw"],
+                1,
+                positions_idx[:, None, None, None].repeat(
+                    1,
+                    1,
+                    ctx["h_EXV_encoder_fw"].shape[-2],
+                    ctx["h_EXV_encoder_fw"].shape[-1],
+                ),
+            )
+            mask_bw_t = torch.gather(
+                ctx["mask_bw"],
+                1,
+                positions_idx[:, None, None, None].repeat(
+                    1, 1, ctx["mask_bw"].shape[-2], ctx["mask_bw"].shape[-1]
+                ),
+            )
+            mask_t_ctx = torch.gather(ctx["mask"], 1, positions_idx[:, None])[:, 0]
+
+            for l, layer in enumerate(self.decoder_layers):
+                h_ESV_decoder_t = cat_neighbors_nodes(
+                    ctx["h_V_stack"][l], h_ES_t, E_idx_t
+                )
+                h_V_t = torch.gather(
+                    ctx["h_V_stack"][l],
+                    1,
+                    positions_idx[:, None, None].repeat(
+                        1, 1, ctx["h_V_stack"][l].shape[-1]
+                    ),
+                )
+                h_ESV_t = mask_bw_t * h_ESV_decoder_t + h_EXV_encoder_t
+                ctx["h_V_stack"][l + 1].scatter_(
+                    1,
+                    positions_idx[:, None, None].repeat(
+                        1, 1, ctx["h_V_stack"][l + 1].shape[-1]
+                    ),
+                    layer(h_V_t, h_ESV_t, mask_V=mask_t_ctx),
+                )
+
+            h_V_t = torch.gather(
+                ctx["h_V_stack"][-1],
+                1,
+                positions_idx[:, None, None].repeat(
+                    1, 1, ctx["h_V_stack"][-1].shape[-1]
+                ),
+            )[:, 0]
+            return self.W_out(h_V_t)
+
+        def _update_context_sequence(ctx, positions, aa_embedding, aa_tokens):
+            positions_idx = positions.view(-1).long()
+            ctx["h_S"].scatter_(
+                1,
+                positions_idx[:, None, None].repeat(
+                    1, 1, aa_embedding.shape[-1]
+                ),
+                aa_embedding[:, None, :],
+            )
+            ctx["S"].scatter_(1, positions_idx[:, None], aa_tokens[:, None])
+
+        def _make_position_tensor(position_value):
+            return torch.full(
+                (B_decoder,), position_value, device=device, dtype=torch.int64
+            )
+
+        chain_mask_combined = mask * chain_mask
         decoding_order = torch.argsort(
-            (chain_mask + 0.0001) * (torch.abs(randn))
-        )  # [numbers will be smaller for places where chain_M = 0.0 and higher for places where chain_M = 1.0]
-        if len(symmetry_list_of_lists[0]) == 0 and len(symmetry_list_of_lists) == 1:
-            E_idx = E_idx.repeat(B_decoder, 1, 1)
+            (chain_mask_combined + 0.0001) * torch.abs(randn)
+        )
+
+        if (
+            len(symmetry_list_of_lists[0]) == 0
+            and len(symmetry_list_of_lists) == 1
+        ):
             permutation_matrix_reverse = torch.nn.functional.one_hot(
                 decoding_order, num_classes=L
             ).float()
@@ -230,236 +349,141 @@ class ProteinMPNN(torch.nn.Module):
                 permutation_matrix_reverse,
                 permutation_matrix_reverse,
             )
-            mask_attend = torch.gather(order_mask_backward, 2, E_idx).unsqueeze(-1)
-            mask_1D = mask.view([B, L, 1, 1])
-            mask_bw = mask_1D * mask_attend
-            mask_fw = mask_1D * (1.0 - mask_attend)
+            order_mask_backward_expanded = order_mask_backward.repeat(
+                B_decoder, 1, 1
+            )
 
-            # repeat for decoding
-            S_true = S_true.repeat(B_decoder, 1)
-            h_V = h_V.repeat(B_decoder, 1, 1)
-            h_E = h_E.repeat(B_decoder, 1, 1, 1)
-            chain_mask = chain_mask.repeat(B_decoder, 1)
-            mask = mask.repeat(B_decoder, 1)
-            bias = bias.repeat(B_decoder, 1, 1)
+            target_ctx = _prepare_context(
+                feature_dict, h_V, h_E, E_idx, order_mask_backward_expanded
+            )
+            off_contexts = []
+            if combine_off:
+                for off_fd, off_h_V, off_h_E, off_E_idx in off_encodings:
+                    off_contexts.append(
+                        _prepare_context(
+                            off_fd,
+                            off_h_V,
+                            off_h_E,
+                            off_E_idx,
+                            order_mask_backward_expanded,
+                        )
+                    )
 
+            batch_dim = target_ctx["S"].shape[0]
+            if penalty_mask is not None:
+                penalty_mask_expanded = penalty_mask
+                if penalty_mask_expanded.dim() == 1:
+                    penalty_mask_expanded = penalty_mask_expanded.unsqueeze(0)
+                if penalty_mask_expanded.shape[0] != batch_dim:
+                    penalty_mask_expanded = penalty_mask_expanded.repeat(batch_dim, 1)
+            else:
+                penalty_mask_expanded = None
             all_probs = torch.zeros(
-                (B_decoder, L, 20), device=device, dtype=torch.float32
+                (batch_dim, L, 20), device=device, dtype=torch.float32
             )
             all_log_probs = torch.zeros(
-                (B_decoder, L, 21), device=device, dtype=torch.float32
+                (batch_dim, L, 21), device=device, dtype=torch.float32
             )
-            all_logits = torch.zeros(
-                (B_decoder, L, 21), device=device, dtype=torch.float32
-            )
-            h_S = torch.zeros_like(h_V, device=device)
-            S = 20 * torch.ones((B_decoder, L), dtype=torch.int64, device=device)
-            h_V_stack = [h_V] + [
-                torch.zeros_like(h_V, device=device)
-                for _ in range(len(self.decoder_layers))
-            ]
 
-            h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
-            h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
-            h_EXV_encoder_fw = mask_fw * h_EXV_encoder
-
-            for t_ in range(L):
-                t = decoding_order[:, t_]  # [B]
-                chain_mask_t = torch.gather(chain_mask, 1, t[:, None])[:, 0]  # [B]
-                mask_t = torch.gather(mask, 1, t[:, None])[:, 0]  # [B]
-                bias_t = torch.gather(bias, 1, t[:, None, None].repeat(1, 1, 21))[
-                    :, 0, :
-                ]  # [B,21]
-
-                E_idx_t = torch.gather(
-                    E_idx, 1, t[:, None, None].repeat(1, 1, E_idx.shape[-1])
-                )
-                h_E_t = torch.gather(
-                    h_E,
-                    1,
-                    t[:, None, None, None].repeat(1, 1, h_E.shape[-2], h_E.shape[-1]),
-                )
-                h_ES_t = cat_neighbors_nodes(h_S, h_E_t, E_idx_t)
-                h_EXV_encoder_t = torch.gather(
-                    h_EXV_encoder_fw,
-                    1,
-                    t[:, None, None, None].repeat(
-                        1, 1, h_EXV_encoder_fw.shape[-2], h_EXV_encoder_fw.shape[-1]
-                    ),
-                )
-
-                mask_bw_t = torch.gather(
-                    mask_bw,
-                    1,
-                    t[:, None, None, None].repeat(
-                        1, 1, mask_bw.shape[-2], mask_bw.shape[-1]
-                    ),
-                )
-
-                for l, layer in enumerate(self.decoder_layers):
-                    h_ESV_decoder_t = cat_neighbors_nodes(h_V_stack[l], h_ES_t, E_idx_t)
-                    h_V_t = torch.gather(
-                        h_V_stack[l],
-                        1,
-                        t[:, None, None].repeat(1, 1, h_V_stack[l].shape[-1]),
-                    )
-                    h_ESV_t = mask_bw_t * h_ESV_decoder_t + h_EXV_encoder_t
-                    h_V_stack[l + 1].scatter_(
-                        1,
-                        t[:, None, None].repeat(1, 1, h_V.shape[-1]),
-                        layer(h_V_t, h_ESV_t, mask_V=mask_t),
+            for t_idx in range(L):
+                pos_indices = decoding_order[:, t_idx].view(-1).long()
+                if pos_indices.shape[0] != batch_dim:
+                    pos_indices = pos_indices.repeat(
+                        batch_dim // pos_indices.shape[0]
                     )
 
-                h_V_t = torch.gather(
-                    h_V_stack[-1],
-                    1,
-                    t[:, None, None].repeat(1, 1, h_V_stack[-1].shape[-1]),
+                logits_target = _context_step_logits(target_ctx, pos_indices)
+                if combine_off:
+                    off_logits_list = [
+                        _context_step_logits(ctx, pos_indices)
+                        for ctx in off_contexts
+                    ]
+                    mean_off_logits = torch.stack(
+                        off_logits_list, dim=0
+                    ).mean(dim=0)
+                    mask_factor = torch.ones(
+                        (batch_dim,), device=device, dtype=logits_target.dtype
+                    )
+                    if penalty_mask_expanded is not None:
+                        mask_factor = torch.gather(
+                            penalty_mask_expanded, 1, pos_indices[:, None]
+                        )[:, 0]
+                    logits_combined = (
+                        target_weight * logits_target
+                        - (mask_factor[:, None] * off_target_weight * mean_off_logits)
+                    )
+                elif target_weight != 1.0:
+                    logits_combined = target_weight * logits_target
+                else:
+                    logits_combined = logits_target
+
+                log_probs_combined = torch.nn.functional.log_softmax(
+                    logits_combined, dim=-1
+                )
+                chain_mask_t = torch.gather(
+                    target_ctx["chain_mask"], 1, pos_indices[:, None]
                 )[:, 0]
-                logits = self.W_out(h_V_t)  # [B,21]
-                all_logits.scatter_(
-                    1, 
-                    t[:, None, None].repeat(1, 1, 21), 
-                    (chain_mask_t[:, None, None] * logits[:, None, :]).float(),
-                )
-                logits_step = logits + bias_t
-                # log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # [B,21]
+                bias_t = torch.gather(
+                    target_ctx["bias"],
+                    1,
+                    pos_indices[:, None, None].repeat(
+                        1, 1, target_ctx["bias"].shape[-1]
+                    ),
+                )[:, 0, :]
 
-                # === external override and bias for logit-based negative design ===
-                def slice_step(x, t):
-                    """
-                    x: [B,21] or [B,L,21] or [B,1,21]
-                    t: [B] long in [0, L)
-                    return: [B,21]
-                    """
-                    if x is None:
-                        return None
-                    if x.dim() == 2:  # [B,21]
-                        return x
-                    if x.dim() == 3:
-                        B, Ls, C = x.shape
-                        assert C == 21, f"expected C=21, got {C}"
-                        if t.dtype != torch.long:
-                            t = t.long()
-                        if Ls == 1:  # [B,1,21] -> squeeze
-                            return x[:, 0, :]
-                        assert (t >= 0).all() and (t < Ls).all(), f"t out of range: max={int(t.max())} >= L={Ls}"
-                        return torch.gather(x, 1, t[:, None, None].expand(B, 1, C))[:, 0]
-                    raise ValueError(f"unsupported dim {x.dim()} for external tensor")
-
-                def norm_off_logits(off_step, tau_off=1.0):
-                    z = torch.nn.functional.log_softmax(off_step / tau_off, dim=-1)  # [B,21]
-                    return z - z.mean(dim=-1, keepdim=True)  # [B,21]
-
-                # ---- external override / bias (contrastive) ----
-                external_override = feature_dict.get("external_logits_override", None)
-                external_bias = feature_dict.get("external_logit_bias", None)
-
-                negative_enable = int(feature_dict.get("negative_enable", 1))
-                alpha = float(feature_dict.get("negative_weight", 0.2))
-                tau_off = 1.0
-
-                # negative_residues: (i) [B,L] mask ∈ {0,1}, (ii) 1D index list, (iii) None
-                neg_res = feature_dict.get("negative_residues", None)
-                apply_contrast = torch.ones((B,), dtype=torch.bool, device=device)
-
-                if neg_res is not None:
-                    if torch.is_tensor(neg_res):
-                        if neg_res.dim() == 2 and neg_res.shape == (B, L):
-                            apply_contrast = torch.gather(neg_res, 1, t[:, None])[:, 0] > 0
-                        elif neg_res.dim() == 1:
-                            idx_set = set(neg_res.tolist())
-                            apply_contrast = torch.tensor([(int(tt.item()) in idx_set) for tt in t],
-                                                        device=device, dtype=torch.bool)
-                        else:
-                            apply_contrast = torch.zeros((B,), dtype=torch.bool, device=device)
-                    else:
-                        apply_contrast = torch.zeros((B,), dtype=torch.bool, device=device)
-
-                # 1) contrastive: logits_tar - alpha * normalize(logits_off)
-                if negative_enable and (external_override is not None) and (alpha > 0.0):
-                    ext_step = slice_step(external_override, t)  # [B,21]
-                    ext_step = norm_off_logits(ext_step, tau_off=tau_off)  # [B,21]
-                    contrast = alpha * ext_step  # [B,21]
-
-                    if apply_contrast.all():
-                        logits_step = logits_step - contrast
-                    elif (~apply_contrast).all():
-                        pass
-                    else:
-                        logits_step = torch.where(apply_contrast[:, None], logits_step - contrast, logits_step)
-
-                # 2) add bias
-                if external_bias is not None:
-                    eb = slice_step(external_bias, t)  # [B,21]
-                    assert eb.shape == logits_step.shape
-                    logits_step = logits_step + eb
-
-                # sampling
-                logits_temp = logits_step / temperature
-                log_probs = torch.nn.functional.log_softmax(logits_temp, dim=-1)  # [B,21]
                 probs = torch.nn.functional.softmax(
-                #     (logits + bias_t) / temperature, dim=-1
-                    logits_temp, dim=-1
-                )  # [B,21]
-                probs_sample = probs[:, :20] / (torch.sum(
+                    (logits_combined + bias_t) / temperature, dim=-1
+                )
+                probs_sample = probs[:, :20] / torch.sum(
                     probs[:, :20], dim=-1, keepdim=True
-                ) + 1e-9)  # except X, prevent underflow
-                S_t = torch.multinomial(probs_sample, 1)[:, 0]  # [B]
+                )
+                sampled_tokens = torch.multinomial(probs_sample, 1)[:, 0]
+                S_true_t = torch.gather(
+                    target_ctx["S_true"], 1, pos_indices[:, None]
+                )[:, 0]
+                selected_tokens = (
+                    sampled_tokens * chain_mask_t
+                    + S_true_t * (1.0 - chain_mask_t)
+                ).long()
+                aa_embedding = self.W_s(selected_tokens)
 
                 all_probs.scatter_(
                     1,
-                    t[:, None, None].repeat(1, 1, 20),
+                    pos_indices[:, None, None].repeat(1, 1, 20),
                     (chain_mask_t[:, None, None] * probs_sample[:, None, :]).float(),
                 )
                 all_log_probs.scatter_(
                     1,
-                    t[:, None, None].repeat(1, 1, 21),
-                    (chain_mask_t[:, None, None] * log_probs[:, None, :]).float(),
+                    pos_indices[:, None, None].repeat(
+                        1, 1, log_probs_combined.shape[-1]
+                    ),
+                    (chain_mask_t[:, None, None] * log_probs_combined[:, None, :]).float(),
                 )
-                S_true_t = torch.gather(S_true, 1, t[:, None])[:, 0]
-                S_t = (S_t * chain_mask_t + S_true_t * (1.0 - chain_mask_t)).long()
-                h_S.scatter_(
-                    1,
-                    t[:, None, None].repeat(1, 1, h_S.shape[-1]),
-                    self.W_s(S_t)[:, None, :],
-                )
-                S.scatter_(1, t[:, None], S_t[:, None])
 
-            # prepare for saving results
-            off_logits = None
-            if isinstance(external_override, torch.Tensor):
-                off_logits = external_override.detach()
-            ext_bias_save = None
-            if isinstance(external_bias, torch.Tensor):
-                ext_bias_save = external_bias.detach()
-            
+                _update_context_sequence(
+                    target_ctx, pos_indices, aa_embedding, selected_tokens
+                )
+                for ctx in off_contexts:
+                    _update_context_sequence(
+                        ctx, pos_indices, aa_embedding, selected_tokens
+                    )
+
             output_dict = {
-                "S": S,
+                "S": target_ctx["S"],
                 "sampling_probs": all_probs,
                 "log_probs": all_log_probs,
                 "decoding_order": decoding_order,
-                # new elements for logit extraction
-                "logits": logits.detach(),
-                "logits_step": logits_step.detach(),
-                "logits_temp": logits_temp.detach(),
-                "logits_all": all_logits.detach(), 
-                # off-target logits, bias, mask, params
-                "off_logits": off_logits, 
-                "external_bias": ext_bias_save,
-                "negative_residues": feature_dict.get("negative_residues", None),
-                "negative_weight": torch.as_tensor(alpha).detach(),
-                "temperature": torch.as_tensor(temperature).detach(),
             }
-        ### symmetry weights 부분도 동일하게 수정하기
         else:
-            # weights for symmetric design
-            symmetry_weights = torch.ones([L], device=device, dtype=torch.float32)
+            symmetry_weights = torch.ones(
+                [L], device=device, dtype=torch.float32
+            )
             for i1, item_list in enumerate(symmetry_list_of_lists):
                 for i2, item in enumerate(item_list):
                     symmetry_weights[item] = symmetry_weights_list_of_lists[i1][i2]
 
             new_decoding_order = []
-            for t_dec in list(decoding_order[0,].cpu().data.numpy()):
+            for t_dec in list(decoding_order[0,].cpu().numpy()):
                 if t_dec not in list(itertools.chain(*new_decoding_order)):
                     list_a = [item for item in symmetry_list_of_lists if t_dec in item]
                     if list_a:
@@ -467,12 +491,12 @@ class ProteinMPNN(torch.nn.Module):
                     else:
                         new_decoding_order.append([t_dec])
 
-            decoding_order = torch.tensor(
+            decoding_order_tensor = torch.tensor(
                 list(itertools.chain(*new_decoding_order)), device=device
             )[None,].repeat(B, 1)
 
             permutation_matrix_reverse = torch.nn.functional.one_hot(
-                decoding_order, num_classes=L
+                decoding_order_tensor, num_classes=L
             ).float()
             order_mask_backward = torch.einsum(
                 "ij, biq, bjp->bqp",
@@ -480,142 +504,130 @@ class ProteinMPNN(torch.nn.Module):
                 permutation_matrix_reverse,
                 permutation_matrix_reverse,
             )
-            mask_attend = torch.gather(order_mask_backward, 2, E_idx).unsqueeze(-1)
-            mask_1D = mask.view([B, L, 1, 1])
-            mask_bw = mask_1D * mask_attend
-            mask_fw = mask_1D * (1.0 - mask_attend)
+            order_mask_backward_expanded = order_mask_backward.repeat(
+                B_decoder, 1, 1
+            )
 
-            # repeat for decoding
-            S_true = S_true.repeat(B_decoder, 1)
-            h_V = h_V.repeat(B_decoder, 1, 1)
-            h_E = h_E.repeat(B_decoder, 1, 1, 1)
-            E_idx = E_idx.repeat(B_decoder, 1, 1)
-            mask_fw = mask_fw.repeat(B_decoder, 1, 1, 1)
-            mask_bw = mask_bw.repeat(B_decoder, 1, 1, 1)
-            chain_mask = chain_mask.repeat(B_decoder, 1)
-            mask = mask.repeat(B_decoder, 1)
-            bias = bias.repeat(B_decoder, 1, 1)
+            target_ctx = _prepare_context(
+                feature_dict, h_V, h_E, E_idx, order_mask_backward_expanded
+            )
+            off_contexts = []
+            if combine_off:
+                for off_fd, off_h_V, off_h_E, off_E_idx in off_encodings:
+                    off_contexts.append(
+                        _prepare_context(
+                            off_fd,
+                            off_h_V,
+                            off_h_E,
+                            off_E_idx,
+                            order_mask_backward_expanded,
+                        )
+                    )
 
+            batch_dim = target_ctx["S"].shape[0]
+            if penalty_mask is not None:
+                penalty_mask_expanded = penalty_mask
+                if penalty_mask_expanded.dim() == 1:
+                    penalty_mask_expanded = penalty_mask_expanded.unsqueeze(0)
+                if penalty_mask_expanded.shape[0] != batch_dim:
+                    penalty_mask_expanded = penalty_mask_expanded.repeat(batch_dim, 1)
+            else:
+                penalty_mask_expanded = None
             all_probs = torch.zeros(
-                (B_decoder, L, 20), device=device, dtype=torch.float32
+                (batch_dim, L, 20), device=device, dtype=torch.float32
             )
             all_log_probs = torch.zeros(
-                (B_decoder, L, 21), device=device, dtype=torch.float32
+                (batch_dim, L, 21), device=device, dtype=torch.float32
             )
-            h_S = torch.zeros_like(h_V, device=device)
-            S = 20 * torch.ones((B_decoder, L), dtype=torch.int64, device=device)
-            h_V_stack = [h_V] + [
-                torch.zeros_like(h_V, device=device)
-                for _ in range(len(self.decoder_layers))
-            ]
-            all_logits_step = torch.zeros(
-                (B_decoder, L, 21), device=device, dtype=torch.float32
-            )
-
-            h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
-            h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
-            h_EXV_encoder_fw = mask_fw * h_EXV_encoder
 
             for t_list in new_decoding_order:
-                total_logits = 0.0
-                total_bias = 0.0
+                total_logits = torch.zeros(
+                    (batch_dim, 21), device=device, dtype=torch.float32
+                )
+                bias_t = None
                 for t in t_list:
-                    chain_mask_t = chain_mask[:, t]  # [B]
-                    mask_t = mask[:, t]  # [B]
-                    bias_t = bias[:, t]  # [B, 21]
-
-                    E_idx_t = E_idx[:, t : t + 1]
-                    h_E_t = h_E[:, t : t + 1]
-                    h_ES_t = cat_neighbors_nodes(h_S, h_E_t, E_idx_t)
-                    h_EXV_encoder_t = h_EXV_encoder_fw[:, t : t + 1]
-                    for l, layer in enumerate(self.decoder_layers):
-                        h_ESV_decoder_t = cat_neighbors_nodes(
-                            h_V_stack[l], h_ES_t, E_idx_t
+                    pos_indices = _make_position_tensor(t)
+                    logits_target = _context_step_logits(target_ctx, pos_indices)
+                    if combine_off:
+                        off_logits_list = [
+                            _context_step_logits(ctx, pos_indices)
+                            for ctx in off_contexts
+                        ]
+                        mean_off_logits = torch.stack(
+                            off_logits_list, dim=0
+                        ).mean(dim=0)
+                        mask_factor = torch.ones(
+                            (batch_dim,), device=device, dtype=logits_target.dtype
                         )
-                        h_V_t = h_V_stack[l][:, t : t + 1]
-                        h_ESV_t = (
-                            mask_bw[:, t : t + 1] * h_ESV_decoder_t + h_EXV_encoder_t
+                        if penalty_mask_expanded is not None:
+                            mask_factor = torch.gather(
+                                penalty_mask_expanded, 1, pos_indices[:, None]
+                            )[:, 0]
+                        logits_combined = (
+                            target_weight * logits_target
+                            - (mask_factor[:, None] * off_target_weight * mean_off_logits)
                         )
-                        h_V_stack[l + 1][:, t : t + 1, :] = layer(
-                            h_V_t, h_ESV_t, mask_V=mask_t[:, None]
-                        )
+                    elif target_weight != 1.0:
+                        logits_combined = target_weight * logits_target
+                    else:
+                        logits_combined = logits_target
 
-                    h_V_t = h_V_stack[-1][:, t]
-                    logits = self.W_out(h_V_t)  # [B,21]
-
-                    log_probs = torch.nn.functional.log_softmax(
-                        logits, dim=-1
-                    )  # [B,21]
+                    log_probs_combined = torch.nn.functional.log_softmax(
+                        logits_combined, dim=-1
+                    )
+                    chain_mask_t = target_ctx["chain_mask"][:, t]
                     all_log_probs[:, t] = (
-                        chain_mask_t[:, None] * log_probs
-                    ).float()  # [B,21]
+                        chain_mask_t[:, None] * log_probs_combined
+                    ).float()
+                    total_logits = total_logits + symmetry_weights[t] * logits_combined
+                    bias_t = target_ctx["bias"][:, t]
 
-                    total_logits += symmetry_weights[t] * logits
-                    total_bias += symmetry_weights[t] * bias_t
-                    
-                total_logits_step = total_logits + total_bias
-
-                # external override and bias for logit-based negative design
-                external_override = feature_dict.get("external_logits_override", None)  # [B,21] or [B,L,21]
-                external_bias = feature_dict.get("external_logit_bias", None)
-
-                if external_override is not None:
-                    if external_override.dim() == 3:
-                        total_override = 0.0
-                        for t in t_list:
-                            total_override += symmetry_weights[t] * external_override[:, t, :]  # [B, 21]
-                        total_logits_step = total_override
-                    else:
-                        total_logits_step = external_override
-                elif external_bias is not None:
-                    if external_bias.dim() == 3:
-                        total_bias = 0.0
-                        for t in t_list:
-                            total_bias += symmetry_weights[t] * external_bias[:, t, :]  # [B, 21]
-                        total_logits_step += total_bias
-                    else:
-                        total_logits_step += external_bias
-                
-                for t in t_list:
-                    all_logits_step[:, t, :] = total_logits_step
-                
-                total_logits_temp = total_logits_step / temperature
                 probs = torch.nn.functional.softmax(
-                    # (total_logits + bias_t) / temperature, dim=-1
-                    total_logits_temp, dim=-1
-                )  # [B,21]
+                    (total_logits + bias_t) / temperature, dim=-1
+                )
                 probs_sample = probs[:, :20] / torch.sum(
                     probs[:, :20], dim=-1, keepdim=True
-                )  # hard omit X #[B,20]
-                S_t = torch.multinomial(probs_sample, 1)[:, 0]  # [B]
+                )
+                sampled_tokens = torch.multinomial(probs_sample, 1)[:, 0]
+
                 for t in t_list:
-                    chain_mask_t = chain_mask[:, t]  # [B]
+                    pos_indices = _make_position_tensor(t)
+                    chain_mask_t = target_ctx["chain_mask"][:, t]
                     all_probs[:, t] = (
                         chain_mask_t[:, None] * probs_sample
-                    ).float()  # [B,20]
-                    S_true_t = S_true[:, t]  # [B]
-                    S_t = (S_t * chain_mask_t + S_true_t * (1.0 - chain_mask_t)).long()
-                    h_S[:, t] = self.W_s(S_t)
-                    S[:, t] = S_t
+                    ).float()
+                    S_true_t = target_ctx["S_true"][:, t]
+                    selected_tokens = (
+                        sampled_tokens * chain_mask_t
+                        + S_true_t * (1.0 - chain_mask_t)
+                    ).long()
+                    aa_embedding = self.W_s(selected_tokens)
+                    _update_context_sequence(
+                        target_ctx, pos_indices, aa_embedding, selected_tokens
+                    )
+                    for ctx in off_contexts:
+                        _update_context_sequence(
+                            ctx, pos_indices, aa_embedding, selected_tokens
+                        )
 
             output_dict = {
-                "S": S,
+                "S": target_ctx["S"],
                 "sampling_probs": all_probs,
                 "log_probs": all_log_probs,
-                "decoding_order": decoding_order.repeat(B_decoder, 1),
-                # new elements for logit extraction
-                "logits": total_logits.detach(),
-                "logits_step": total_logits_step.detach(),
-                "logits_temp": total_logits_temp.detach(),
-                "all_logits_step": all_logits_step[0].detach()  # [L,21]
+                "decoding_order": decoding_order_tensor.repeat(B_decoder, 1),
             }
         return output_dict
-
     def single_aa_score(self, feature_dict, use_sequence: bool):
         """
         feature_dict - input features
         use_sequence - False using backbone info only
         """
+        off_target_feature_dicts = feature_dict.get("off_target_features") or []
+        target_weight = float(feature_dict.get("target_weight", 1.0))
+        off_target_weight = float(feature_dict.get("off_target_weight", 1.0))
+        penalty_mask = feature_dict.get("off_target_residue_mask")
+        combine_off = len(off_target_feature_dicts) > 0 and abs(off_target_weight) > 0.0
+
         B_decoder = feature_dict["batch_size"]
         S_true_enc = feature_dict[
             "S"
@@ -636,6 +648,13 @@ class ProteinMPNN(torch.nn.Module):
         log_probs_out = torch.zeros([B_decoder, L, 21], device=device).float()
         logits_out = torch.zeros([B_decoder, L, 21], device=device).float()
         decoding_order_out = torch.zeros([B_decoder, L, L], device=device).float()
+
+        if penalty_mask is not None and torch.is_tensor(penalty_mask):
+            penalty_mask = penalty_mask.to(device=device, dtype=torch.float32)
+            if penalty_mask.dim() == 1:
+                penalty_mask = penalty_mask.unsqueeze(0)
+        else:
+            penalty_mask = None
 
         for idx in range(L):
             h_V = torch.clone(h_V_enc)
@@ -691,6 +710,33 @@ class ProteinMPNN(torch.nn.Module):
             logits_out[:,idx,:] = logits[:,idx,:]
             decoding_order_out[:,idx,:] = decoding_order
 
+        if combine_off:
+            off_logits_collection = []
+            for off_fd in off_target_feature_dicts:
+                off_plain = off_fd.copy()
+                off_plain["off_target_features"] = []
+                off_plain["target_weight"] = 1.0
+                off_plain["off_target_weight"] = 1.0
+                off_result = self.single_aa_score(off_plain, use_sequence)
+                off_logits_collection.append(off_result["logits"])
+            if off_logits_collection:
+                mean_off_logits = torch.stack(off_logits_collection, dim=0).mean(dim=0)
+                logits_scaled = target_weight * logits_out
+                if penalty_mask is not None:
+                    mask_expanded = penalty_mask
+                    if mask_expanded.shape[0] != logits_scaled.shape[0]:
+                        repeat_factor = logits_scaled.shape[0] // mask_expanded.shape[0]
+                        mask_expanded = mask_expanded.repeat(repeat_factor, 1)
+                    mask_expanded = mask_expanded[:, :, None]
+                    logits_out = logits_scaled - off_target_weight * mask_expanded * mean_off_logits
+                else:
+                    logits_out = logits_scaled - off_target_weight * mean_off_logits
+                log_probs_out = torch.nn.functional.log_softmax(logits_out, dim=-1)
+        else:
+            if target_weight != 1.0:
+                logits_out = target_weight * logits_out
+                log_probs_out = torch.nn.functional.log_softmax(logits_out, dim=-1)
+
         output_dict = {
             "S": S_true,
             "log_probs": log_probs_out,
@@ -701,6 +747,12 @@ class ProteinMPNN(torch.nn.Module):
 
 
     def score(self, feature_dict, use_sequence: bool):
+        off_target_feature_dicts = feature_dict.get("off_target_features") or []
+        target_weight = float(feature_dict.get("target_weight", 1.0))
+        off_target_weight = float(feature_dict.get("off_target_weight", 1.0))
+        penalty_mask = feature_dict.get("off_target_residue_mask")
+        combine_off = len(off_target_feature_dicts) > 0 and abs(off_target_weight) > 0.0
+
         B_decoder = feature_dict["batch_size"]
         S_true = feature_dict[
             "S"
@@ -721,6 +773,13 @@ class ProteinMPNN(torch.nn.Module):
         device = S_true.device
 
         h_V, h_E, E_idx = self.encode(feature_dict)
+
+        if penalty_mask is not None and torch.is_tensor(penalty_mask):
+            penalty_mask = penalty_mask.to(device=device, dtype=torch.float32)
+            if penalty_mask.dim() == 1:
+                penalty_mask = penalty_mask.unsqueeze(0)
+        else:
+            penalty_mask = None
 
         chain_mask = mask * chain_mask  # update chain_M to include missing regions
         decoding_order = torch.argsort(
@@ -799,6 +858,33 @@ class ProteinMPNN(torch.nn.Module):
 
         logits = self.W_out(h_V)
         log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+        if combine_off:
+            off_logits_collection = []
+            for off_fd in off_target_feature_dicts:
+                off_plain = off_fd.copy()
+                off_plain["off_target_features"] = []
+                off_plain["target_weight"] = 1.0
+                off_plain["off_target_weight"] = 1.0
+                off_result = self.score(off_plain, use_sequence)
+                off_logits_collection.append(off_result["logits"])
+            if off_logits_collection:
+                mean_off_logits = torch.stack(off_logits_collection, dim=0).mean(dim=0)
+                logits_scaled = target_weight * logits
+                if penalty_mask is not None:
+                    mask_expanded = penalty_mask
+                    if mask_expanded.shape[0] != logits_scaled.shape[0]:
+                        repeat_factor = logits_scaled.shape[0] // mask_expanded.shape[0]
+                        mask_expanded = mask_expanded.repeat(repeat_factor, 1)
+                    mask_expanded = mask_expanded[:, :, None]
+                    logits = logits_scaled - off_target_weight * mask_expanded * mean_off_logits
+                else:
+                    logits = logits_scaled - off_target_weight * mean_off_logits
+                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        else:
+            if target_weight != 1.0:
+                logits = target_weight * logits
+                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
 
         output_dict = {
             "S": S_true,

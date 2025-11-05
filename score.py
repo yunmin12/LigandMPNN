@@ -99,6 +99,60 @@ def main(args) -> None:
         for pdb in pdb_paths:
             redesigned_residues_multi[pdb] = redesigned_residues
 
+    def _normalize_off_target_list(raw_value):
+        if raw_value is None:
+            return []
+        if isinstance(raw_value, list):
+            items = []
+            for entry in raw_value:
+                items.extend(_normalize_off_target_list(entry))
+            return items
+        if isinstance(raw_value, str):
+            if raw_value.strip() == "":
+                return []
+            return [item.strip() for item in raw_value.split(",") if item.strip()]
+        raise ValueError(f"Unsupported off-target entry type: {type(raw_value)}")
+
+    def _compute_auto_pocket_mask(feature_dict, cutoff_radius):
+        if "Y" not in feature_dict or "Y_m" not in feature_dict:
+            return None
+        X = feature_dict.get("X")
+        mask = feature_dict.get("mask")
+        if X is None or mask is None:
+            return None
+        X = X[0]
+        mask = mask[0]
+        Y = feature_dict["Y"][0]
+        Y_m = feature_dict["Y_m"][0]
+        if Y.numel() == 0 or torch.sum(Y_m) == 0:
+            return None
+        N = X[:, 0, :]
+        CA = X[:, 1, :]
+        C = X[:, 2, :]
+        b = CA - N
+        c = C - CA
+        a = torch.cross(b, c, dim=-1)
+        CB = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + CA
+        diff = Y - CB[:, None, :]
+        distances = torch.linalg.norm(diff, dim=-1)
+        distances = distances.masked_fill(Y_m == 0, float("inf"))
+        min_distances = torch.min(distances, dim=-1).values
+        pocket_mask = ((min_distances <= cutoff_radius) & torch.isfinite(min_distances)).float() * mask
+        return pocket_mask.unsqueeze(0)
+
+    global_off_targets = _normalize_off_target_list(args.off_target_pdb_path)
+    legacy_global_off_targets = _normalize_off_target_list(args.offtarget_pdb_path)
+    combined_global_off_targets = list(
+        dict.fromkeys(global_off_targets + legacy_global_off_targets)
+    )
+    off_target_map = {pdb: list(combined_global_off_targets) for pdb in pdb_paths}
+    if args.off_target_pdb_path_multi:
+        with open(args.off_target_pdb_path_multi, "r") as fh:
+            off_target_multi = json.load(fh)
+        for key, value in off_target_multi.items():
+            combined = off_target_map.get(key, list(global_off_targets)) + _normalize_off_target_list(value)
+            off_target_map[key] = list(dict.fromkeys(combined))
+
     # loop over PDB paths
     for pdb in pdb_paths:
         if args.verbose:
@@ -274,6 +328,78 @@ def main(args) -> None:
             # add additional keys to the feature dictionary
             feature_dict["symmetry_residues"] = remapped_symmetry_residues
 
+            current_off_targets = off_target_map.get(pdb, list(combined_global_off_targets))
+            off_feature_dicts = []
+            for off_path in current_off_targets:
+                off_protein_dict, _, _, off_icodes, _ = parse_PDB(
+                    off_path,
+                    device=device,
+                    chains=args.parse_these_chains_only,
+                    parse_all_atoms=args.ligand_mpnn_use_side_chain_context,
+                    parse_atoms_with_zero_occupancy=args.parse_atoms_with_zero_occupancy,
+                )
+                off_encoded_residues = []
+                off_r_idx_list = list(off_protein_dict["R_idx"].cpu().numpy())
+                off_chain_letters = list(off_protein_dict["chain_letters"])
+                for idx_tmp, r_idx_item in enumerate(off_r_idx_list):
+                    off_encoded_residues.append(
+                        str(off_chain_letters[idx_tmp]) + str(r_idx_item) + off_icodes[idx_tmp]
+                    )
+                if off_encoded_residues != encoded_residues:
+                    raise ValueError(
+                        f"Residue mapping mismatch between target {pdb} and off-target {off_path}."
+                    )
+                off_protein_dict["chain_mask"] = protein_dict["chain_mask"]
+                if "membrane_per_residue_labels" in protein_dict:
+                    off_protein_dict["membrane_per_residue_labels"] = protein_dict[
+                        "membrane_per_residue_labels"
+                    ]
+                off_feature_dict = featurize(
+                    off_protein_dict,
+                    cutoff_for_score=args.ligand_mpnn_cutoff_for_score,
+                    use_atom_context=args.ligand_mpnn_use_atom_context,
+                    number_of_ligand_atoms=atom_context_num,
+                    model_type=args.model_type,
+                )
+                off_feature_dict["batch_size"] = args.batch_size
+                off_feature_dict["symmetry_residues"] = remapped_symmetry_residues
+                off_feature_dicts.append(off_feature_dict)
+
+            feature_dict["off_target_features"] = off_feature_dicts
+            mask_components = []
+            if args.auto_pocket:
+                auto_mask = _compute_auto_pocket_mask(feature_dict, args.auto_pocket_cutoff)
+                if auto_mask is not None:
+                    mask_components.append(auto_mask)
+                else:
+                    if args.verbose:
+                        print("[Warning] auto pocket requested but ligand context absent; falling back to full mask.")
+            if getattr(args, "negative_residues", ""):
+                idxs = []
+                for tok in str(args.negative_residues).strip().split():
+                    try:
+                        idx_val = int(tok)
+                        if 0 <= idx_val < L:
+                            idxs.append(idx_val)
+                    except ValueError:
+                        continue
+                if idxs:
+                    manual_mask = torch.zeros((1, L), dtype=torch.float32, device=device)
+                    manual_mask[:, idxs] = 1.0
+                    mask_components.append(manual_mask)
+            if mask_components:
+                penalty_mask_tensor = torch.ones((1, L), dtype=torch.float32, device=device)
+                for mask_component in mask_components:
+                    penalty_mask_tensor = penalty_mask_tensor * mask_component
+                feature_dict["off_target_residue_mask"] = penalty_mask_tensor
+
+            target_weight = float(args.target_logit_weight)
+            off_weight = float(args.off_target_logit_weight)
+            if getattr(args, "negative_enable", 0):
+                off_weight = float(args.negative_weight)
+            feature_dict["target_weight"] = target_weight
+            feature_dict["off_target_weight"] = off_weight
+
             logits_list = []
             probs_list = []
             log_probs_list = []
@@ -283,6 +409,8 @@ def main(args) -> None:
                     [feature_dict["batch_size"], feature_dict["mask"].shape[1]],
                     device=device,
                 )
+                for off_fd in feature_dict["off_target_features"]:
+                    off_fd["randn"] = feature_dict["randn"]
                 if args.autoregressive_score:
                     score_dict = model.score(feature_dict, use_sequence=args.use_sequence)
                 elif args.single_aa_score:
@@ -312,147 +440,6 @@ def main(args) -> None:
             out_dict["alphabet"] = alphabet
             out_dict["residue_names"] = encoded_residue_dict_rev
 
-            # off-target logits, bias, settings
-            if "external_logits_override" in feature_dict:
-                out_dict["off_logits_mean"] = feature_dict["external_logits_override"][0].detach().cpu().numpy()  # [1, L, 21] -> [L, 21]
-
-            if "external_logit_bias" in feature_dict and isinstance(feature_dict["external_logit_bias"], torch.Tensor):
-                out_dict["external_bias"] = feature_dict["external_logit_bias"][0].detach().cpu().numpy() \
-                    if feature_dict["external_logit_bias"].dim() == 3 else feature_dict["external_logit_bias"].detach().cpu().numpy()
-
-            if "negative_residues" in feature_dict and isinstance(feature_dict["negative_residues"], torch.Tensor):
-                out_dict["negative_residues"] = feature_dict["negative_residues"][0].detach().cpu().numpy() \
-                    if feature_dict["negative_residues"].dim() == 2 else feature_dict["negative_residues"].detach().cpu().numpy()
-
-            out_dict["temperature_run"] = float(feature_dict.get("temperature", 1.0))
-            out_dict["negative_weight"] = float(feature_dict.get("negative_weight", getattr(args, "negative_weight", 0.0)))
-            
-            import copy
-            
-            def _logit_pass(fd: dict) -> torch.Tensor:
-                fdc = copy.deepcopy(fd)
-                fdc["batch_size"] = 1
-                fdc["temperature"] = 1.0
-                fdc["randn"] = torch.zeros([1, fdc["mask"].shape[1]], device=device)
-                fdc.pop("external_logits_override", None)
-                fdc.pop("external_logit_bias", None)
-                if "symmetry_residues" not in fdc:
-                    fdc["symmetry_residues"] = []
-                if "symmetry_weights" not in fdc:
-                    fdc["symmetry_weights"]  = []
-                if "bias" not in fdc:
-                    L_here = fdc["mask"].shape[1]
-                    fdc["bias"] = torch.zeros((1, L_here, 21), dtype=torch.float32, device=device)
-                out = model.sample(fdc)
-                return out["logits_all"][0].to(device)  # [L,21]
-
-            if len(args.parse_these_chains_only) != 0:
-                parse_these_chains_only_list = args.parse_these_chains_only.split(",")
-            else:
-                parse_these_chains_only_list = []
-            
-            def _make_off_feature_dict(off_pdb_path: str) -> dict:
-                # Parse and featurize off-target PDB(s)
-                off_protein_dict, _, _, off_icodes, _ = parse_PDB(
-                    off_pdb_path,
-                    device=device,
-                    chains=parse_these_chains_only_list,
-                    parse_all_atoms=1,
-                    parse_atoms_with_zero_occupancy=args.parse_atoms_with_zero_occupancy,
-                )
-                if off_protein_dict["R_idx"].shape != protein_dict["R_idx"].shape:
-                    raise RuntimeError("R_idx length mismatch between target and off-target.")
-                for k in ["chain_mask", "membrane_per_residue_labels"]:
-                    if k in protein_dict:
-                        off_protein_dict[k] = protein_dict[k]
-                ofd = featurize(
-                    off_protein_dict,
-                    cutoff_for_score=args.ligand_mpnn_cutoff_for_score,
-                    use_atom_context=args.ligand_mpnn_use_atom_context,
-                    number_of_ligand_atoms=atom_context_num,
-                    model_type=args.model_type,
-                )
-                L_off = ofd["X"].shape[1]
-                assert L_off == L, "Off-target length mismatch"
-                
-                ofd["batch_size"] = 1
-                ofd["temperature"] = 1.0
-                bias = feature_dict.get("bias", None)
-                ofd["randn"] = torch.zeros([1, ofd["mask"].shape[1]], device=device)
-                if isinstance(bias, torch.Tensor):
-                    ofd["bias"] = bias.detach().clone()[:1]  # [1, L, 21]
-                else:
-                    ofd["bias"] = torch.zeros((1, L, 21), dtype=torch.float32, device=device)
-                if "symmetry_residues" in feature_dict:
-                    ofd["symmetry_residues"] = feature_dict["symmetry_residues"]
-                if "symmetry_weights" in feature_dict:
-                    ofd["symmetry_weights"] = feature_dict["symmetry_weights"]
-                return ofd
-            
-            off_mean = None
-            if args.offtarget_pdb_path and len(args.offtarget_pdb_path) > 0:
-                off_paths = args.offtarget_pdb_path if isinstance(args.offtarget_pdb_path, (list, tuple)) else [args.offtarget_pdb_path]
-                off_list = []
-                for off_p in args.offtarget_pdb_path:
-                    ofd = _make_off_feature_dict(off_p)
-                    off_list.append(_logit_pass(ofd))   # [L,21]
-                if off_list:
-                    offs = torch.stack(off_list, 0)
-                    off_mean = offs.mean(0)  # [L,21]
-
-            if off_mean is not None and args.negative_enable:
-                feature_dict["external_logits_override"] = off_mean.unsqueeze(0)  # [1,L,21]
-                feature_dict["negative_enable"] = int(args.negative_enable)
-                feature_dict["negative_weight"] = float(args.negative_weight)
-                if getattr(args, "negative_tau_off", None) is not None:
-                    feature_dict["negative_tau_off"] = float(args.negative_tau_off)
-                if getattr(args, "negative_residues", ""):
-                    L_here = feature_dict["mask"].shape[1]
-                    idxs = []
-                    for tok in str(args.negative_residues).split():
-                        try:
-                            i = int(tok)
-                            if 0 <= i < L_here:
-                                idxs.append(i)
-                        except:
-                            pass
-                    if idxs:
-                        m = torch.zeros((1, L_here), dtype=torch.float32, device=device)
-                        m[:, idxs] = 1.0
-                        feature_dict["negative_residues"] = m
-            else:
-                feature_dict.pop("external_logits_override", None)
-                feature_dict["negative_enable"] = 0
-
-
-            device = feature_dict["mask"].device
-            B = int(feature_dict.get("batch_size", 1))
-            L = int(feature_dict["mask"].shape[1])
-            feature_dict["batch_size"] = B
-
-            # Ensuring
-            if "bias" not in feature_dict or not isinstance(feature_dict["bias"], torch.Tensor):
-                feature_dict["bias"] = torch.zeros((B, L, 21), dtype=torch.float32, device=device)
-            else:
-                if feature_dict["bias"].dim() == 3 and feature_dict["bias"].shape[0] != B:
-                    feature_dict["bias"] = feature_dict["bias"][:1].repeat(B, 1, 1)
-            if "chain_mask" not in feature_dict or not isinstance(feature_dict["chain_mask"], torch.Tensor):
-                feature_dict["chain_mask"] = torch.ones((B, L), dtype=torch.float32, device=device)
-            feature_dict.setdefault("symmetry_residues", [])
-            feature_dict.setdefault("symmetry_weights", [])
-            feature_dict["temperature"] = float(getattr(args, "temperature", 1.0))
-            if "randn" not in feature_dict or not isinstance(feature_dict["randn"], torch.Tensor) \
-            or feature_dict["randn"].shape != (B, L):
-                feature_dict["randn"] = torch.zeros((B, L), device=device)
-            if "external_logits_override" not in feature_dict:
-                feature_dict["negative_enable"] = 0
-
-            out = model.sample(feature_dict)
-            out_dict["probs"] = out["sampling_probs"].detach().cpu().numpy()
-
-            if off_mean is not None:
-                out_dict["off_logits_mean"] = off_mean.detach().cpu().numpy()
-            
             mean_probs = np.mean(out_dict["probs"], 0)
             std_probs = np.std(out_dict["probs"], 0)
             sequence = [restype_int_to_str[AA] for AA in out_dict["native_sequence"]]
@@ -469,71 +456,6 @@ def main(args) -> None:
             out_dict["std_of_probs"] = std_dict
             torch.save(out_dict, output_stats_path)
 
-            # Save out_dict as npy and csv
-            import csv, gzip
-            os.makedirs(args.out_folder, exist_ok=True)
-
-            def _open_out(path):
-                return gzip.open(path, "wt") if path.endswith(".gz") else open(path, "w")
-
-            def save_per_residue_realized_csv(meta, logits, log_probs):
-                alph = {a:i for i,a in enumerate(meta["alphabet"])}
-                seq = meta["sequence"]
-                resn = meta.get("residue_names", {})
-                path = output_sum_path + "_per_residue_scores.csv"
-                with _open_out(path) as f:
-                    w = csv.writer(f)
-                    w.writerow(["idx","residue","aa","logit","log_prob"])
-                    for i,a in enumerate(seq):
-                        j = alph[a]
-                        name = resn.get(str(i), str(i))
-                        w.writerow([i, name, a, float(logits[i,j]), float(log_probs[i,j])])
-
-            def save_matrix_wide_csv(meta, arr, fname):
-                # arr: [L,V] (logits or log_probs)
-                alph = meta["alphabet"]
-                resn = meta.get("residue_names", {})
-                path = output_sum_path + "_" + fname
-                with _open_out(path) as f:
-                    w = csv.writer(f)
-                    w.writerow(["idx","residue"] + list(alph))
-                    L, V = arr.shape
-                    for i in range(L):
-                        name = resn.get(str(i), str(i))
-                        row = [i, name] + [f"{arr[i,j]:.6f}" for j in range(V)]
-                        w.writerow(row)
-
-            def save_topk_json(meta, log_probs, k=5):
-                alph = meta["alphabet"]
-                resn = meta.get("residue_names", {})
-                L, V = log_probs.shape
-                out = []
-                for i in range(L):
-                    idx = np.argsort(log_probs[i])[::-1][:k]
-                    out.append({
-                        "idx": i,
-                        "residue": resn.get(str(i), str(i)),
-                        "topk": [{"aa": alph[j], "log_prob": float(log_probs[i,j])} for j in idx]
-                    })
-                path = output_sum_path + "_topk.json"
-                with open(path, "w") as f:
-                    json.dump(out, f)
-            
-            output_sum_path = base_folder + name + args.file_ending
-            logits = out_dict["logits"][0] # [L, V]
-            log_probs = out_dict["log_probs"][0]
-            meta = {
-                "alphabet": out_dict["alphabet"],
-                "sequence": out_dict["sequence"],
-                "residue_names": out_dict.get("residue_names", {})
-            }
-            output_meta_path = output_sum_path + "_meta.json"
-            with open(output_meta_path, "w") as f:
-                json.dump(meta, f)
-            save_per_residue_realized_csv(meta, logits, log_probs)
-            save_matrix_wide_csv(meta, logits, "logits.csv.gz")
-            save_matrix_wide_csv(meta, log_probs, "log_probs.csv.gz")
-            save_topk_json(meta, log_probs, 5)
 
 
 if __name__ == "__main__":
@@ -555,35 +477,30 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--checkpoint_protein_mpnn",
         type=str,
-        # default="./model_params/proteinmpnn_v_48_020.pt",
         default="/home/yunmin/proj/LigandMPNN/model_params/proteinmpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_ligand_mpnn",
         type=str,
-        # default="./model_params/ligandmpnn_v_32_010_25.pt",
         default="/home/yunmin/proj/LigandMPNN/model_params/ligandmpnn_v_32_010_25.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_per_residue_label_membrane_mpnn",
         type=str,
-        # default="./model_params/per_residue_label_membrane_mpnn_v_48_020.pt",
         default="/home/yunmin/proj/LigandMPNN/model_params/per_residue_label_membrane_mpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_global_label_membrane_mpnn",
         type=str,
-        # default="./model_params/global_label_membrane_mpnn_v_48_020.pt",
         default="/home/yunmin/proj/LigandMPNN/model_params/global_label_membrane_mpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_soluble_mpnn",
         type=str,
-        # default="./model_params/solublempnn_v_48_020.pt",
         default="/home/yunmin/proj/LigandMPNN/model_params/solublempnn_v_48_020.pt",
         help="Path to model weights.",
     )
@@ -598,6 +515,68 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="Path to json listing PDB paths. {'/path/to/pdb': ''} - only keys will be used.",
+    )
+
+    argparser.add_argument(
+        "--off_target_pdb_path",
+        type=str,
+        default="",
+        help="Comma-separated list of off-target PDB paths to include during scoring.",
+    )
+    argparser.add_argument(
+        "--off_target_pdb_path_multi",
+        type=str,
+        default="",
+        help="Path to JSON mapping each target PDB path to a list of off-target structures.",
+    )
+    argparser.add_argument(
+        "--target_logit_weight",
+        type=float,
+        default=1.0,
+        help="Weight applied to target logits before combining with off-target predictions.",
+    )
+    argparser.add_argument(
+        "--off_target_logit_weight",
+        type=float,
+        default=1.0,
+        help="Weight applied to the mean off-target logits before subtraction.",
+    )
+    argparser.add_argument(
+        "--auto_pocket",
+        type=int,
+        default=0,
+        help="If set to 1, restrict off-target penalties to residues within --auto_pocket_cutoff Angstroms of the ligand.",
+    )
+    argparser.add_argument(
+        "--auto_pocket_cutoff",
+        type=float,
+        default=8.0,
+        help="Distance cutoff (Angstrom) for defining the ligand pocket when --auto_pocket is enabled.",
+    )
+
+    argparser.add_argument(
+        "--offtarget_pdb_path",
+        action="append",
+        default=None,
+        help="Legacy repeatable flag for off-target PDBs; kept for backward compatibility.",
+    )
+    argparser.add_argument(
+        "--negative_enable",
+        type=int,
+        default=0,
+        help="Compatibility toggle for legacy contrastive scoring.",
+    )
+    argparser.add_argument(
+        "--negative_weight",
+        type=float,
+        default=1.0,
+        help="Penalty weight when --negative_enable is set.",
+    )
+    argparser.add_argument(
+        "--negative_residues",
+        type=str,
+        default="",
+        help="Space-separated zero-based residue indices where off-target penalties apply.",
     )
 
     argparser.add_argument(
@@ -756,21 +735,5 @@ if __name__ == "__main__":
         help="1 - run single amino acid scoring function; p(AA_i|backbone, AA_{all except ith one}), 0 - False",
     )
 
-    argparser.add_argument(
-        "--offtarget_pdb_path", 
-        action="append",
-        default=None,
-        help="Repeatable. PDB(s) for off-target ligand contexts. Same backbone/sequence indexing expected.",
-    )
-
-    argparser.add_argument(
-        "--temperature", type=float, default=1.0,
-        help="Sampling temperature for score forward pass (default: 1.0)"
-    )
-
-    argparser.add_argument(
-        "--negative_tau_off", type=float, default=1.0,
-    )
-    
     args = argparser.parse_args()
     main(args)

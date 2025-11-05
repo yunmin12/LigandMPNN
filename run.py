@@ -1,5 +1,6 @@
 import argparse
 import copy
+import csv
 import json
 import os.path
 import random
@@ -186,6 +187,60 @@ def main(args) -> None:
         parse_these_chains_only_list = args.parse_these_chains_only.split(",")
     else:
         parse_these_chains_only_list = []
+
+    def _normalize_off_target_list(raw_value):
+        if raw_value is None:
+            return []
+        if isinstance(raw_value, list):
+            items = []
+            for entry in raw_value:
+                items.extend(_normalize_off_target_list(entry))
+            return items
+        if isinstance(raw_value, str):
+            if raw_value.strip() == "":
+                return []
+            return [item.strip() for item in raw_value.split(",") if item.strip()]
+        raise ValueError(f"Unsupported off-target entry type: {type(raw_value)}")
+
+    def _compute_auto_pocket_mask(feature_dict, cutoff_radius):
+        if "Y" not in feature_dict or "Y_m" not in feature_dict:
+            return None
+        X = feature_dict.get("X")
+        mask = feature_dict.get("mask")
+        if X is None or mask is None:
+            return None
+        X = X[0]
+        mask = mask[0]
+        Y = feature_dict["Y"][0]
+        Y_m = feature_dict["Y_m"][0]
+        if Y.numel() == 0 or torch.sum(Y_m) == 0:
+            return None
+        N = X[:, 0, :]
+        CA = X[:, 1, :]
+        C = X[:, 2, :]
+        b = CA - N
+        c = C - CA
+        a = torch.cross(b, c, dim=-1)
+        CB = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + CA
+        diff = Y - CB[:, None, :]
+        distances = torch.linalg.norm(diff, dim=-1)
+        distances = distances.masked_fill(Y_m == 0, float("inf"))
+        min_distances = torch.min(distances, dim=-1).values
+        pocket_mask = ((min_distances <= cutoff_radius) & torch.isfinite(min_distances)).float() * mask
+        return pocket_mask.unsqueeze(0)
+
+    global_off_targets = _normalize_off_target_list(args.off_target_pdb_path)
+    legacy_global_off_targets = _normalize_off_target_list(args.offtarget_pdb_path)
+    combined_global_off_targets = list(
+        dict.fromkeys(global_off_targets + legacy_global_off_targets)
+    )
+    off_target_map = {pdb: list(combined_global_off_targets) for pdb in pdb_paths}
+    if args.off_target_pdb_path_multi:
+        with open(args.off_target_pdb_path_multi, "r") as fh:
+            off_target_multi = json.load(fh)
+        for key, value in off_target_multi.items():
+            combined = off_target_map.get(key, list(combined_global_off_targets)) + _normalize_off_target_list(value)
+            off_target_map[key] = list(dict.fromkeys(combined))
 
 
     # loop over PDB paths
@@ -411,94 +466,80 @@ def main(args) -> None:
             feature_dict["symmetry_residues"] = remapped_symmetry_residues
             feature_dict["symmetry_weights"] = symmetry_weights
 
-            def _make_off_feature_dict(off_pdb_path: str) -> dict:
-                # Parse and featurize off-target PDB(s)
+            current_off_targets = off_target_map.get(pdb, list(combined_global_off_targets))
+            off_feature_dicts = []
+            for off_path in current_off_targets:
                 off_protein_dict, _, _, off_icodes, _ = parse_PDB(
-                    off_pdb_path,
+                    off_path,
                     device=device,
                     chains=parse_these_chains_only_list,
                     parse_all_atoms=parse_all_atoms_flag,
                     parse_atoms_with_zero_occupancy=args.parse_atoms_with_zero_occupancy,
                 )
-                if off_protein_dict["R_idx"].shape != protein_dict["R_idx"].shape:
-                    raise RuntimeError("R_idx length mismatch between target and off-target.")
+                off_encoded_residues = []
+                off_r_idx_list = list(off_protein_dict["R_idx"].cpu().numpy())
+                off_chain_letters = list(off_protein_dict["chain_letters"])
+                for idx_tmp, r_idx_item in enumerate(off_r_idx_list):
+                    off_encoded_residues.append(
+                        str(off_chain_letters[idx_tmp]) + str(r_idx_item) + off_icodes[idx_tmp]
+                    )
+                if off_encoded_residues != encoded_residues:
+                    raise ValueError(
+                        f"Residue mapping mismatch between target {pdb} and off-target {off_path}."
+                    )
                 off_protein_dict["chain_mask"] = protein_dict["chain_mask"]
-                off_protein_dict["membrane_per_residue_labels"] = protein_dict["membrane_per_residue_labels"]
-                ofd = featurize(
+                if "membrane_per_residue_labels" in protein_dict:
+                    off_protein_dict["membrane_per_residue_labels"] = protein_dict[
+                        "membrane_per_residue_labels"
+                    ]
+                off_feature_dict = featurize(
                     off_protein_dict,
                     cutoff_for_score=args.ligand_mpnn_cutoff_for_score,
                     use_atom_context=args.ligand_mpnn_use_atom_context,
                     number_of_ligand_atoms=atom_context_num,
                     model_type=args.model_type,
                 )
-                L_off = ofd["X"].shape[1]
-                assert L_off == L, "Off-target length mismatch"
-                ofd["batch_size"] = 1
-                ofd["temperature"] = args.temperature
-                ofd["bias"] = feature_dict["bias"].detach().clone()[:1]   # [1,L,21]
-                ofd["symmetry_residues"] = feature_dict["symmetry_residues"]
-                ofd["symmetry_weights"]  = feature_dict["symmetry_weights"]
-                return ofd
+                off_feature_dict["batch_size"] = args.batch_size
+                off_feature_dict["temperature"] = args.temperature
+                off_feature_dict["bias"] = torch.zeros_like(feature_dict["bias"])
+                off_feature_dict["symmetry_residues"] = remapped_symmetry_residues
+                off_feature_dict["symmetry_weights"] = symmetry_weights
+                off_feature_dicts.append(off_feature_dict)
 
-            def _logit_pass(fd: dict) -> torch.Tensor:
-                fdc = copy.deepcopy(fd)
-                fdc["batch_size"] = 1
-                fdc["randn"] = torch.zeros([1, fdc["mask"].shape[1]], device=device)
-                fdc.pop("external_logits_override", None)
-                fdc.pop("external_logit_bias", None)
-                fdc["temperature"] = 1.0
-                out = model.sample(fdc)
-                # raw logits 사용 (bias/override 전)
-                # out["logits"]: [L,21], out["logits_step"]: [L,21] (external/bias 적용 후)
-                return out["logits"].to(device)  # [L,21]
+            feature_dict["off_target_features"] = off_feature_dicts
+            mask_components = []
+            if args.auto_pocket:
+                auto_mask = _compute_auto_pocket_mask(feature_dict, args.auto_pocket_cutoff)
+                if auto_mask is not None:
+                    mask_components.append(auto_mask)
+                else:
+                    if args.verbose:
+                        print("[Warning] auto pocket requested but ligand context absent; falling back to full mask.")
+            if getattr(args, "negative_residues", ""):
+                idxs = []
+                for tok in str(args.negative_residues).strip().split():
+                    try:
+                        idx_val = int(tok)
+                        if 0 <= idx_val < L:
+                            idxs.append(idx_val)
+                    except ValueError:
+                        continue
+                if idxs:
+                    manual_mask = torch.zeros((1, L), dtype=torch.float32, device=device)
+                    manual_mask[:, idxs] = 1.0
+                    mask_components.append(manual_mask)
+            if mask_components:
+                penalty_mask_tensor = torch.ones((1, L), dtype=torch.float32, device=device)
+                for mask_component in mask_components:
+                    penalty_mask_tensor = penalty_mask_tensor * mask_component
+                feature_dict["off_target_residue_mask"] = penalty_mask_tensor
 
-            if args.negative_enable and args.offtarget_pdb_path and len(args.offtarget_pdb_path) > 0:
-                # 1) target prepass
-                target_fd_pp = copy.deepcopy(feature_dict)
-                target_fd_pp["batch_size"] = 1
-                target_fd_pp["temperature"] = 1.0
-                target_fd_pp["randn"] = torch.zeros([1, target_fd_pp["mask"].shape[1]], device=device)
-                target_fd_pp.pop("external_logits_override", None)
-                target_fd_pp.pop("external_logit_bias", None)
-                t_logit = _logit_pass(target_fd_pp)  # [L,21] (raw)
-
-                # 2) off-target prepass (average raw logits)
-                off_logp_list = []
-                for off_p in args.offtarget_pdb_path:
-                    ofd = _make_off_feature_dict(off_p)
-                    ofd["batch_size"] = 1
-                    ofd["temperature"] = 1.0
-                    ofd["randn"] = torch.zeros([1, ofd["mask"].shape[1]], device=device)
-                    off_logp_list.append(_logit_pass(ofd))  # [L,21] (raw)
-
-                # 3) hand the average of off-target to model_utils for contrastive logits tuning
-                if off_logp_list:
-                    offs = torch.stack(off_logp_list, 0)   # [K, L, 21]
-                    off_mean = offs.mean(0)                # [L, 21]
-                    feature_dict["external_logits_override"] = off_mean.unsqueeze(0)  # [1, L, 21]
-                    feature_dict["temperature"] = args.temperature
-
-                    # contrastive tuning parameters (>>> model_utils.py)
-                    feature_dict["negative_enable"] = int(args.negative_enable)
-                    feature_dict["negative_weight"] = float(args.negative_weight)
-
-                    # negative_residues parsing: "10 25 47" → [1, L] mask (suppose batch_size=1)
-                    neg_res_mask = None
-                    if getattr(args, "negative_residues", ""):
-                        L = feature_dict["mask"].shape[1]
-                        idxs = []
-                        for tok in str(args.negative_residues).strip().split():
-                            try:
-                                idx = int(tok)
-                                if 0 <= idx < L:
-                                    idxs.append(idx)
-                            except:
-                                pass
-                        if idxs:
-                            neg_res_mask = torch.zeros((1, L), dtype=torch.float32, device=device)
-                            neg_res_mask[:, idxs] = 1.0
-                    if neg_res_mask is not None:
-                        feature_dict["negative_residues"] = neg_res_mask  # [1, L]
+            target_weight = float(args.target_logit_weight)
+            off_weight = float(args.off_target_logit_weight)
+            if getattr(args, "negative_enable", 0):
+                off_weight = float(args.negative_weight)
+            feature_dict["target_weight"] = target_weight
+            feature_dict["off_target_weight"] = off_weight
 
             sampling_probs_list = []
             log_probs_list = []
@@ -512,6 +553,8 @@ def main(args) -> None:
                     [feature_dict["batch_size"], feature_dict["mask"].shape[1]],
                     device=device,
                 )
+                for off_fd in feature_dict["off_target_features"]:
+                    off_fd["randn"] = feature_dict["randn"]
                 output_dict = model.sample(feature_dict)
 
                 # compute confidence scores
@@ -566,7 +609,6 @@ def main(args) -> None:
             output_stats_json = base_folder + "stats/" + name + args.file_ending + ".json"
             output_stats_csv = base_folder + "stats/" + name + args.file_ending + ".csv"
 
-
             out_dict = {}
             out_dict["generated_sequences"] = S_stack.cpu()
             out_dict["sampling_probs"] = sampling_probs_stack.cpu()
@@ -577,64 +619,56 @@ def main(args) -> None:
             out_dict["chain_mask"] = feature_dict["chain_mask"][0].cpu()
             out_dict["seed"] = seed
             out_dict["temperature"] = args.temperature
-            dbg = feature_dict.pop("_contrastive_debug", None)
-            if dbg is not None:
-                out_dict["contrastive_per_ligand_logits_step"] = dbg["per_ligand_logits_step"]  # [B,L,21]
-                out_dict["contrastive_fused_logits_step"] = dbg["fused_logits_step"]  # [L,21]
             if args.save_stats:
                 torch.save(out_dict, output_stats_path)
-            
-            # Save stats as json and csv
-            def to_serializable(obj):
-                if isinstance(obj, dict):
-                    return {k: to_serializable(v) for k, v in obj.items()}
-                if isinstance(obj, (list, tuple)):
-                    return [to_serializable(x) for x in obj]
-                if hasattr(obj, "item") and callable(getattr(obj, "item", None)) and getattr(obj, "ndim", 1) == 0:
-                    try:
-                        return obj.item()
-                    except Exception:
-                        pass
-                if isinstance(obj, torch.Tensor):
-                    return obj.detach().cpu().tolist()
-                if np is not None:
-                    if isinstance(obj, np.ndarray):
-                        return obj.tolist()
-                if isinstance(obj, set):
-                    return list(obj)
-                return obj
-            serial = to_serializable(out_dict)
 
             if args.save_stats:
+                def _to_serializable(obj):
+                    if isinstance(obj, dict):
+                        return {k: _to_serializable(v) for k, v in obj.items()}
+                    if isinstance(obj, (list, tuple)):
+                        return [_to_serializable(x) for x in obj]
+                    if hasattr(obj, "item") and getattr(obj, "ndim", 1) == 0:
+                        try:
+                            return obj.item()
+                        except Exception:
+                            pass
+                    if isinstance(obj, torch.Tensor):
+                        return obj.detach().cpu().tolist()
+                    if np is not None and isinstance(obj, np.ndarray):
+                        return obj.tolist()
+                    if isinstance(obj, set):
+                        return list(obj)
+                    return obj
+
+                serializable = _to_serializable(out_dict)
                 try:
                     with open(output_stats_json, "w", encoding="utf-8") as jf:
-                        json.dump(serial, jf, indent=2, ensure_ascii=False)
-                except Exception as e:
-                    print(f"[Warning] failed to write JSON stats: {e}")
-            
-            import csv
-            def flatten(d, prefix="", acc=None):
-                if acc is None:
-                    acc = {}
-                if isinstance(d, dict):
-                    for k, v in d.items():
-                        flatten(v, f"{prefix}{k}." if prefix else f"{k}.", acc)
-                elif isinstance(d, (list, tuple)):
-                    acc[prefix[:-1]] = json.dumps(d, ensure_ascii=False)
-                else:
-                    acc[prefix[:-1]] = d
-                return acc
-            
-            if args.save_stats:
+                        json.dump(serializable, jf, indent=2, ensure_ascii=False)
+                except Exception as exc:
+                    print(f"[Warning] failed to write JSON stats: {exc}")
+
+                def _flatten_dict(d, prefix="", acc=None):
+                    if acc is None:
+                        acc = {}
+                    if isinstance(d, dict):
+                        for k, v in d.items():
+                            _flatten_dict(v, f"{prefix}{k}." if prefix else f"{k}.", acc)
+                    elif isinstance(d, (list, tuple)):
+                        acc[prefix[:-1]] = json.dumps(d, ensure_ascii=False)
+                    else:
+                        acc[prefix[:-1]] = d
+                    return acc
+
                 try:
-                    flat = flatten(serial)
+                    flat_stats = _flatten_dict(serializable)
                     with open(output_stats_csv, "w", newline="", encoding="utf-8") as cf:
-                        writer = csv.DictWriter(cf, fieldnames=list(flat.keys()))
+                        writer = csv.DictWriter(cf, fieldnames=list(flat_stats.keys()))
                         writer.writeheader()
-                        writer.writerow(flat)
-                except Exception as e:
-                    print(f"[Warning] failed to write CSV stats: {e}")
-            
+                        writer.writerow(flat_stats)
+                except Exception as exc:
+                    print(f"[Warning] failed to write CSV stats: {exc}")
+
             if args.pack_side_chains:
                 if args.verbose:
                     print("Packing side chains...")
@@ -689,7 +723,7 @@ def main(args) -> None:
                     X_m_stack_list.append(X_m_stack)
                     b_factor_stack_list.append(b_factor_stack)
                 print("Side chain packing is done!")
-                
+
             with open(output_fasta, "w") as f:
                 f.write(
                     ">{}, T={}, seed={}, num_res={}, num_ligand_res={}, use_ligand_context={}, ligand_cutoff_distance={}, batch_size={}, number_of_batches={}, model_path={}\n{}\n".format(
@@ -841,35 +875,30 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--checkpoint_protein_mpnn",
         type=str,
-        # default="./model_params/proteinmpnn_v_48_020.pt",
         default="/home/yunmin/proj/LigandMPNN/model_params/proteinmpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_ligand_mpnn",
         type=str,
-        # default="./model_params/ligandmpnn_v_32_010_25.pt",
         default="/home/yunmin/proj/LigandMPNN/model_params/ligandmpnn_v_32_010_25.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_per_residue_label_membrane_mpnn",
         type=str,
-        # default="./model_params/per_residue_label_membrane_mpnn_v_48_020.pt",
         default="/home/yunmin/proj/LigandMPNN/model_params/per_residue_label_membrane_mpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_global_label_membrane_mpnn",
         type=str,
-        # default="./model_params/global_label_membrane_mpnn_v_48_020.pt",
         default="/home/yunmin/proj/LigandMPNN/model_params/global_label_membrane_mpnn_v_48_020.pt",
         help="Path to model weights.",
     )
     argparser.add_argument(
         "--checkpoint_soluble_mpnn",
         type=str,
-        # default="./model_params/solublempnn_v_48_020.pt",
         default="/home/yunmin/proj/LigandMPNN/model_params/solublempnn_v_48_020.pt",
         help="Path to model weights.",
     )
@@ -890,6 +919,68 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="Path to json listing PDB paths. {'/path/to/pdb': ''} - only keys will be used.",
+    )
+
+    argparser.add_argument(
+        "--off_target_pdb_path",
+        type=str,
+        default="",
+        help="Comma-separated list of off-target PDB paths to penalize during design.",
+    )
+    argparser.add_argument(
+        "--off_target_pdb_path_multi",
+        type=str,
+        default="",
+        help="Path to JSON mapping each target PDB path to a list of off-target PDBs.",
+    )
+    argparser.add_argument(
+        "--target_logit_weight",
+        type=float,
+        default=1.0,
+        help="Weight applied to target logits before combining with off-target predictions.",
+    )
+    argparser.add_argument(
+        "--off_target_logit_weight",
+        type=float,
+        default=1.0,
+        help="Weight applied to the mean off-target logits before subtraction.",
+    )
+    argparser.add_argument(
+        "--auto_pocket",
+        type=int,
+        default=0,
+        help="If set to 1, restrict off-target penalties to residues within --auto_pocket_cutoff Angstroms of the ligand.",
+    )
+    argparser.add_argument(
+        "--auto_pocket_cutoff",
+        type=float,
+        default=8.0,
+        help="Distance cutoff (Angstrom) for defining the ligand pocket when --auto_pocket is enabled.",
+    )
+
+    argparser.add_argument(
+        "--offtarget_pdb_path",
+        action="append",
+        default=None,
+        help="Legacy repeatable flag for off-target PDBs; kept for backward compatibility.",
+    )
+    argparser.add_argument(
+        "--negative_enable",
+        type=int,
+        default=0,
+        help="Compatibility toggle for legacy contrastive decoding logic.",
+    )
+    argparser.add_argument(
+        "--negative_weight",
+        type=float,
+        default=1.0,
+        help="Penalty weight when --negative_enable is set.",
+    )
+    argparser.add_argument(
+        "--negative_residues",
+        type=str,
+        default="",
+        help="Space-separated zero-based residue indices where off-target penalties apply.",
     )
 
     argparser.add_argument(
@@ -1138,35 +1229,6 @@ if __name__ == "__main__":
         default=1,
         help="1-pack side chains using ligand context, 0 - do not use it.",
     )
-
-    # Additional arguments for logit-based negative design
-    argparser.add_argument(
-        "--offtarget_pdb_path", 
-        action="append", 
-        default=None,
-        help="Repeatable. PDB(s) for off-target ligand contexts. Same backbone/sequence indexing expected.",
-    )
-
-    argparser.add_argument(
-        "--negative_enable",
-        type=int,
-        default=1,
-        help="1 to enable contrastive decoding, 0 to disable.",
-    )
-
-    argparser.add_argument(
-        "--negative_weight", 
-        type=float, 
-        default=1.0,
-        help="Weight for off-target penalty (alpha).",
-    )
-    
-    argparser.add_argument(
-        "--negative_residues",
-        type=str,
-        default="",
-        help="Designate the residues to give penalties. Space separated."
-        )
 
     args = argparser.parse_args()
     main(args)
