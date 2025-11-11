@@ -23,27 +23,31 @@ for MUT_DIR in "$OUT_DIR"/*; do
     PRT_MUT="$(basename "$MUT_DIR")"
     for PREFIX_DIR in "$MUT_DIR"/*; do
       PREFIX="$(basename "$PREFIX_DIR")"
+      if [ "$PREFIX" != "$2" ]; then
+        continue
+      fi
       for LIG_DIR in "$PREFIX_DIR"/*; do
-        OFF_TGT="$(basename "LIG_DIR")"
+        OFF_TGT="$(basename "$LIG_DIR")"
         echo "📁 Current directory: $LIG_DIR"
-        SCORE_DIR="${LIG_DIR}/scores"
+        SCORE_DIR="${LIG_DIR}/off_scores"
         mkdir -p $SCORE_DIR
         OFF_DIR="${IN_OFF_DIR}/${PRT_MUT}/${PREFIX%_*}_${OFF_TGT}"
         OFFS=( "$OFF_DIR"/*.pdb )
         OFF_ARGS=()
-        for f in "${OFFS[@]}"; do OFF_ARGS+=( --offtarget_pdb_path "$f" ); done
-        python /home/yunmin/proj/LigandMPNN/score.py \
-          --seed 111 \
-          --model_type "ligand_mpnn" \
-          --pdb_path "$(ls $BASE/lmpnn_in_tar/$PRT_MUT/${PREFIX}/*.pdb | head -n 1)" \
-          --out_folder "$SCORE_DIR" \
-          --number_of_batches 4 \
-          --batch_size 1 \
-          --single_aa_score 1 \
-          --use_sequence 1 \
-          "${OFF_ARGS[@]}"
+        for f in "${OFFS[@]}"; do
+          echo $f
+          python /home/yunmin/proj/LigandMPNN/score.py \
+            --seed 111 \
+            --model_type "ligand_mpnn" \
+            --pdb_path "$f" \
+            --out_folder "$SCORE_DIR" \
+            --number_of_batches 4 \
+            --batch_size 1 \
+            --single_aa_score 1 \
+            --use_sequence 1;
+        done    
       done
-  done
+    done
 done
 ###############################################
 slurm_end $SLURM_CHANNEL_ID

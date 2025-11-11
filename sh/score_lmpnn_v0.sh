@@ -2,13 +2,11 @@
 #SBATCH -J lmpnn
 #SBATCH -c 4
 #SBATCH -q normal
-#SBATCH -p cpu
+#SBATCH -p gpu
+#SBATCH --gres=gpu:1
 #SBATCH --mem=16G
 
 # source /home/yunmin/miniforge3/bin/activate ligandmpnn_env
-export CUDA_LAUNCH_BLOCKING=1
-export TORCH_BACKTRACE=1
-
 echo "===== Script Contents ====="
 echo "submitted script: $0"
 cat "$0"
@@ -21,7 +19,8 @@ slurm_start $SLURM_CHANNEL_ID
 set -euo pipefail
 
 BASE_DIR="${BASE_DIR:-$HOME/proj/data/db/v2}"
-OUT_DIR=${1:-$BASE_DIR/lmpnn_out_1028_v0}
+OUT_DIR_SUFFIX=${1:-lmpnn_out_1028_v0}
+OUT_DIR="$BASE_DIR/$OUT_DIR_SUFFIX"
 
 shopt -s nullglob
 for MUT_DIR in "$OUT_DIR"/*; do
@@ -31,11 +30,11 @@ for MUT_DIR in "$OUT_DIR"/*; do
       echo "📁 Current directory: $PREFIX_DIR"
       SCORE_DIR="$PREFIX_DIR/scores"
       mkdir -p $SCORE_DIR
-
+      
       python /home/yunmin/proj/LigandMPNN/score.py \
         --seed 111 \
         --model_type "ligand_mpnn" \
-        --pdb_path $(ls $PREFIX_DIR/backbones/*.pdb | head -n 1) \
+        --pdb_path $(ls $BASE_DIR/lmpnn_in_tar/$PRT_MUT/${PREFIX}/*.pdb | head -n 1) \
         --out_folder "$SCORE_DIR" \
         --number_of_batches 4 \
         --batch_size 1 \

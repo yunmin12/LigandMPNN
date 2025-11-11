@@ -23,14 +23,14 @@ set -euo pipefail
 
 BASE_DIR="${BASE_DIR:-$HOME/proj/data/db/v2}"
 IN_OFF_DIR="$BASE_DIR/lmpnn_in_off"
-OUT_ROOT="${BASE_DIR}/lmpnn_out_1029_v1"
+OUT_ROOT="${BASE_DIR}/lmpnn_out_1031_v1"
 mkdir -p "$OUT_ROOT"
 
 SEED=111
-NB=4
-PACK_SC=0
-PACKS_PER=0
-PACK_WITH_LIG=0
+NB=10
+PACK_SC=1
+PACKS_PER=1
+PACK_WITH_LIG=1
 TEMP="$1"
 NEG_ENABLE=1
 NEG_WEIGHT="$2"
@@ -60,7 +60,7 @@ for TGT in "$BASE_DIR"/*/cleaned_tar/*.pdb; do
     OFFS=( "$PREFIX_DIR"/*.pdb )
     (( ${#OFFS[@]} )) || continue
  
-    OUT_DIR="${OUT_ROOT}/${PRT_MUT}/${PREFIX}"
+    OUT_DIR="${OUT_ROOT}/${PRT_MUT}/${PRT_MUT_PDB}/${PREFIX##*_}"
     mkdir -p "$OUT_DIR"
 
     OFF_ARGS=()

@@ -15,15 +15,15 @@ set -euo pipefail
 
 BASE=/home/yunmin/proj/data/db/v2
 IN_OFF_DIR="${BASE}/lmpnn_in_off"
-OUT_DIR=${1:-$BASE/lmpnn_out_1028_v1}
+OUT_DIR=${1:-lmpnn_out_1028_v1}
 
 shopt -s nullglob
-for MUT_DIR in "$OUT_DIR"/*; do
+for MUT_DIR in "${BASE}/${OUT_DIR}"/*; do
     PRT_MUT="$(basename "$MUT_DIR")"
     for PREFIX_DIR in "$MUT_DIR"/*; do
       PREFIX="$(basename "$PREFIX_DIR")"
-      echo "📁 Current directory: $BASE/$PRT_MUT/$PREFIX"
-      SCORE_DIR="$BASE/$PRT_MUT/$PREFIX/scores"
+      echo "📁 Current directory: $PREFIX_DIR"
+      SCORE_DIR="$PREFIX_DIR/scores_v2"
       mkdir -p $SCORE_DIR
       OFF_DIR="${IN_OFF_DIR}/${PRT_MUT}/${PREFIX}"
       OFFS=( "$OFF_DIR"/*.pdb )
@@ -32,7 +32,7 @@ for MUT_DIR in "$OUT_DIR"/*; do
       python /home/yunmin/proj/LigandMPNN/score.py \
         --seed 111 \
         --model_type "ligand_mpnn" \
-        --pdb_path $(ls $PREFIX_DIR/backbones/*.pdb | head -n 1) \
+        --pdb_path $(ls $BASE_DIR/lmpnn_in_tar/$PRT_MUT/${PREFIX}/*.pdb | head -n 1) \
         --out_folder "$SCORE_DIR" \
         --number_of_batches 4 \
         --batch_size 1 \

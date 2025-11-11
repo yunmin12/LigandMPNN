@@ -22,11 +22,11 @@ set -euo pipefail
 BASE_DIR="${BASE_DIR:-$HOME/proj/data/db/v2}"
 IN_TAR_DIR="${BASE_DIR}/lmpnn_in_tar"
 IN_OFF_DIR="${BASE_DIR}/lmpnn_in_off"
-OUT_ROOT="${BASE_DIR}/lmpnn_out_1029_v2"
+OUT_ROOT="${BASE_DIR}/lmpnn_out_1031_v2"
 mkdir -p "$OUT_ROOT"
 
 SEED=111
-NB=4
+NB=10
 PACK_SC=1
 PACKS_PER=1
 PACK_WITH_LIG=1

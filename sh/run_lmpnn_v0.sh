@@ -6,9 +6,6 @@
 #SBATCH --mem=16G
 
 # source /home/yunmin/miniforge3/bin/activate ligandmpnn_env
-export CUDA_LAUNCH_BLOCKING=1
-export TORCH_BACKTRACE=1
-
 echo "===== Script Contents ====="
 echo "submitted script: $0"
 cat "$0"
@@ -21,11 +18,11 @@ slurm_start $SLURM_CHANNEL_ID
 set -euo pipefail
 
 BASE_DIR="${BASE_DIR:-$HOME/proj/data/db/v2}"
-OUT_ROOT="${BASE_DIR}/lmpnn_out_1029_v0"
+OUT_ROOT="${BASE_DIR}/lmpnn_out_1031_v0"
 mkdir -p "$OUT_ROOT"
 
 SEED=111
-NB=4
+NB=10
 PACK_SC=1
 PACKS_PER=1
 PACK_WITH_LIG=1
