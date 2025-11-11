@@ -2,121 +2,99 @@ import numpy as np
 import pandas as pd
 import os, glob, sys
 import argparse
+from typing import Optional, Dict, Tuple
+
 
 def _choose_plddt(df: pd.DataFrame):
     if "plddt" in df.columns and df["plddt"].notna().any():
         return df["plddt"].to_numpy()
-    return df["plddt_pde"].to_numpy()
+    if "plddt_pde" in df.columns:
+        return df["plddt_pde"].to_numpy()
+    return np.full(len(df), np.nan, dtype=np.float32)
 
-def filter_self(df: pd.DataFrame, topk: int = 15) -> pd.DataFrame:
-    rmsd   = df["rmsd"].to_numpy()
-    prmsd  = df["prmsd"].to_numpy()
-    kabsch = df["kabsch"].to_numpy() if "kabsch" in df.columns else None
-    plddt  = _choose_plddt(df)
 
-    # strict
-    # mask = (rmsd <= 2.0) & (plddt >= 0.75) & (prmsd < 3.0)
-    # if kabsch is not None:
-    #     mask &= (kabsch <= 0.8)
-    # loose
-    mask = (rmsd <= 2.0)
+def filter_by_thresholds(
+    df: pd.DataFrame,
+    rmsd_cutoff: float,
+    plddt_cutoff: Optional[float],
+) -> pd.DataFrame:
+    rmsd = df["rmsd"].to_numpy()
+    mask = np.isfinite(rmsd) & (rmsd <= rmsd_cutoff)
 
-    idx = np.flatnonzero(mask)
-    if idx.size == 0:
-        return df.iloc[[]]
-
-    # alignment key: plddt(desc) → prmsd(asc) → rmsd(asc)
-    key1 = -plddt[idx]
-    key2 =  prmsd[idx]
-    key3 =  rmsd[idx]
-    ord_idx = np.lexsort((key3, key2, key1))
-    pick = idx[ord_idx[:min(topk, idx.size)]]
-    return df.iloc[pick]
-
-def filter_cross(df: pd.DataFrame, topk: int = 30):
-    rmsd   = df["rmsd"].to_numpy()
-    prmsd  = df["prmsd"].to_numpy()
-    kabsch = df["kabsch"].to_numpy() if "kabsch" in df.columns else None
-    plddt  = _choose_plddt(df)
-
-    # strict
-    # mask = (rmsd <= 6.0) & (plddt >= 0.70) & (prmsd < 4.0)
-    # if kabsch is not None:
-    #     mask &= (kabsch <= 1.0)
-    # loose
-    mask = (rmsd <= 8.0) & (plddt >= 0.65)
-
+    if plddt_cutoff is not None:
+        plddt = _choose_plddt(df)
+        mask &= np.isfinite(plddt) & (plddt >= plddt_cutoff)
 
     idx = np.flatnonzero(mask)
     if idx.size == 0:
         return df.iloc[[]]
+    return df.iloc[idx]
 
-    # alignment key: plddt(desc) → prmsd(asc)
-    key1 = -plddt[idx]
-    key2 =  prmsd[idx]
-    ord_idx = np.lexsort((key2, key1))
-    pick = idx[ord_idx[:min(topk, idx.size)]]
-    return df.iloc[pick]
 
-def rank_topk_self(df: pd.DataFrame, topk=15) -> pd.DataFrame:
-    plddt = _choose_plddt(df)
-    prmsd = df["prmsd"].to_numpy()
-    rmsd  = df["rmsd"].to_numpy()
-    ok = np.isfinite(plddt) & np.isfinite(prmsd) & np.isfinite(rmsd)
-    idx = np.flatnonzero(ok)
-    if idx.size == 0: return df.iloc[[]]
-    key1, key2, key3 = -plddt[idx], prmsd[idx], rmsd[idx]
-    ord_idx = np.lexsort((key3, key2, key1))
-    return df.iloc[idx[ord_idx[:min(topk, idx.size)]]]
+def rank_by_rmsd(df: pd.DataFrame, topk: Optional[int]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    ordered = df.sort_values(by="rmsd", ascending=True)
+    if topk is None:
+        return ordered
+    return ordered.iloc[: min(topk, len(ordered))]
 
-def rank_topk_cross(df: pd.DataFrame, topk=30) -> pd.DataFrame:
-    plddt = _choose_plddt(df)
-    prmsd = df["prmsd"].to_numpy()
-    ok = np.isfinite(plddt) & np.isfinite(prmsd)
-    idx = np.flatnonzero(ok)
-    if idx.size == 0: return df.iloc[[]]
-    key1, key2 = -plddt[idx], prmsd[idx]
-    ord_idx = np.lexsort((key2, key1))
-    return df.iloc[idx[ord_idx[:min(topk, idx.size)]]]
+
+def _load_threshold_overrides(csv_path: str) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+    df = pd.read_csv(csv_path)
+    if "label" not in df.columns:
+        raise ValueError("threshold CSV must contain a 'label' column")
+    has_rmsd = "rmsd_threshold" in df.columns
+    has_plddt = "plddt_threshold" in df.columns
+    overrides: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+    for _, row in df.iterrows():
+        label = str(row["label"])
+        rmsd_val = float(row["rmsd_threshold"]) if has_rmsd and not pd.isna(row["rmsd_threshold"]) else None
+        plddt_val = float(row["plddt_threshold"]) if has_plddt and not pd.isna(row["plddt_threshold"]) else None
+        overrides[label] = (rmsd_val, plddt_val)
+    return overrides
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--base_dir", required=True)
     p.add_argument("--type", choices=["tar", "off"], required=True)
-    p.add_argument("--mode", choices=["self", "cross"], required=True)
-    # p.add_argument("--method", choices=["filter", "rank"], default="rank")
-    p.add_argument("--topk", type=int, default=None)
+    p.add_argument("--rmsd", type=float, default=None,
+                   help="Default maximum RMSD allowed during filtering (Å).")
+    p.add_argument("--plddt", type=float, default=None,
+                   help="Default minimum pLDDT allowed during filtering.")
+    p.add_argument("--topk", type=int, default=50,
+                   help="Maximum number of ranked models to keep.")
+    p.add_argument("--threshold_csv", type=str, default=None,
+                   help="Optional CSV with per-file thresholds (columns: label,rmsd_threshold,plddt_threshold).")
     args = p.parse_args()
 
-    # Display the filtering criteria
-    lines = [
-        ["Mode", "rmsd", "plddt", "prmsd", "kabsch", "Top-k"],
-        ["self",  "<=2.0 Å", ">=0.75", "<3.0", "<=0.8", "15"],
-        ["cross", "<=6.0 Å", ">=0.70", "<4.0", "<=1.0", "30"]
-    ]
-    widths = [max(len(x) for x in col) for col in zip(*lines)]
+    DEFAULT_RMSD = 10.0
+    DEFAULT_PLDDT = 0.5
 
+    rmsd_threshold = args.rmsd if args.rmsd is not None else DEFAULT_RMSD
+    plddt_threshold = args.plddt if args.plddt is not None else DEFAULT_PLDDT
+    topk = args.topk
+    threshold_overrides = _load_threshold_overrides(args.threshold_csv) if args.threshold_csv else {}
+    
     print("\n   === PLACER Ensemble Filtering Criteria ===")
-    print("-" * (sum(widths) + 3 * (len(widths) - 1)))
-    for i, row in enumerate(lines):
-        print(" | ".join(x.ljust(w) for x, w in zip(row, widths)))
-        if i == 0:
-            print("-" * (sum(widths) + 3 * (len(widths) - 1)))
-    print("-" * (sum(widths) + 3 * (len(widths) - 1)))
+    plddt_msg = f"{plddt_threshold:.2f}" if plddt_threshold is not None else "N/A"
+    print("Default thresholds:")
+    print(f"  - RMSD ≤ {rmsd_threshold:.2f} Å")
+    print(f"  - pLDDT ≥ {plddt_msg}")
+    print(f"  - Top-k: {topk}")
+    if threshold_overrides:
+        print(f"Per-file overrides loaded: {len(threshold_overrides)}")
 
     summary_rows = []
-    USECOLS = ["rmsd","prmsd","plddt","plddt_pde","kabsch"]
-    is_self = (args.mode == 'self')
-    # is_rank = (args.method == 'rank')
-    topk = args.topk if args.topk is not None else (15 if is_self else 30)
+    USECOLS = ["rmsd", "plddt", "plddt_pde"]
 
     subdirs = sorted([d for d in glob.glob(os.path.join(args.base_dir, "*"))])
     for sub in subdirs:
-        placer_dir = os.path.join(sub, f"placer_{args.type}")
-        filter_dir = os.path.join(sub, f"filter_{args.type}")
+        placer_dir = os.path.join(sub, f"placer_{args.type}_large")
+        filter_dir = os.path.join(sub, f"filter_{args.type}_large")
 
-        if not (os.path.isdir(placer_dir)):
+        if not os.path.isdir(placer_dir):
             continue
         os.makedirs(filter_dir, exist_ok=True)
         print(f"📁 Subdir: {os.path.basename(sub)}")
@@ -129,49 +107,60 @@ def main():
         for file in files:
             header_cols = pd.read_csv(file, nrows=0).columns
             usecols = [c for c in USECOLS if c in header_cols]
-            if not set(["rmsd","prmsd"]).issubset(usecols):
-                print(f"required columns missing in {file}", file=sys.stderr)
+            if "rmsd" not in usecols:
+                print(f"'rmsd' column missing in {file}", file=sys.stderr)
                 continue
 
-            df = pd.read_csv(file, usecols=usecols, dtype={c:"float32" for c in usecols})
-            filtered_df = filter_self(df, topk=topk) if is_self else filter_cross(df, topk=topk)
-            
+            label = os.path.splitext(os.path.basename(file))[0]
+            override = threshold_overrides.get(label, (None, None))
+            file_rmsd = override[0] if override[0] is not None else rmsd_threshold
+            file_plddt = override[1] if override[1] is not None else plddt_threshold
+            if file_rmsd is None:
+                print(f"rmsd threshold missing for {label}, skipping", file=sys.stderr)
+                continue
+
+            df = pd.read_csv(file, usecols=usecols, dtype={c: "float32" for c in usecols})
+            filtered_df = filter_by_thresholds(df, file_rmsd, file_plddt)
+
             # Save filtered csv
             stem = os.path.splitext(os.path.basename(file))[0]
-            filter_path = os.path.join(filter_dir, stem + "_filtered.csv")
+            filter_path = os.path.join(filter_dir, stem + "_filtered_large.csv")
             filtered_df.to_csv(filter_path, index=False)
-            print(f"[{args.type}][{args.mode}] {os.path.basename(file)} ({len(filtered_df)}/{len(df)})")
+            log_msg = f"[{args.type}] {os.path.basename(file)} ({len(filtered_df)}/{len(df)})"
+            log_msg += f" rmsd≤{file_rmsd:.2f}"
+            if file_plddt is not None:
+                log_msg += f" plddt≥{file_plddt:.2f}"
+            print(log_msg)
 
-            # if is_rank:
-            rank_df = rank_topk_self(df, topk=topk) if is_self else rank_topk_cross(df, topk=topk)
-            ranked_indices = rank_df.index.to_list()
-            rank_path = os.path.join(filter_dir, stem + "_ranked.csv")
+            rank_df = rank_by_rmsd(filtered_df, topk=topk)
+            rank_path = os.path.join(filter_dir, stem + "_ranked_large.csv")
             rank_df.to_csv(rank_path, index=False, float_format="%.4f")
 
             # Summary csv
-            label = os.path.splitext(os.path.basename(file))[0]
-            filtered_idx_list = [i+1 for i in filtered_df.index.to_list()] # PDB MODEL is 1-based
+            filtered_idx_list = filtered_df.index.to_list()  # PDB MODEL is 0-based
             filtered_indices_str = ",".join(map(str, filtered_idx_list))
-            ranked_idx_list = [i+1 for i in rank_df.index.to_list()] # PDB MODEL is 1-based
+            ranked_idx_list = rank_df.index.to_list()
             ranked_indices_str = ",".join(map(str, ranked_idx_list))
 
             summary_rows.append({
                 "label": label,
                 "type": args.type,
-                "mode": args.mode,
                 "filtered_count": len(filtered_df),
                 "filtered_model_indices": filtered_indices_str,
-                "ranked_count": topk,
+                "ranked_count": len(ranked_idx_list),
                 "ranked_model_indices": ranked_indices_str,
+                "rmsd_threshold": file_rmsd,
+                "plddt_threshold": file_plddt if file_plddt is not None else "",
             })
     if summary_rows:
         summary_df = pd.DataFrame(summary_rows, columns=[
-            "label", "type", "mode", 
+            "label", "type",
             "filtered_count", "filtered_model_indices",
             "ranked_count", "ranked_model_indices",
-            ])
-        summary_path = os.path.join(args.base_dir, f"ensemble_{args.type}_summary.csv")
-        summary_df.to_csv((summary_path), index=False)
+            "rmsd_threshold", "plddt_threshold",
+        ])
+        summary_path = os.path.join(args.base_dir, f"ensemble_{args.type}_summary_large.csv")
+        summary_df.to_csv(summary_path, index=False)
         print(f"Summary csv is saved as {summary_path}")
     else:
         print("no rows collected")
