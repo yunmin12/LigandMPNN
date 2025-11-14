@@ -1,8 +1,6 @@
-import argparse, os, glob, sys
+import argparse, os, glob, sys, copy
 from typing import Tuple, Dict
 from Bio.PDB import PDBParser, PDBIO, Select
-
-BACKBONE = {"N","CA","C","O","OXT"}
 
 def residue_key(res):
     het, resseq, icode = res.id
@@ -20,35 +18,23 @@ def build_index(structure):
             idx[residue_key(res)] = res
     return idx
 
-def copy_xyz(dst_atom, src_atom):
-    dst_atom.set_coord(src_atom.get_coord())
-    dst_atom.set_bfactor(src_atom.get_bfactor())
-    dst_atom.set_occupancy(src_atom.get_occupancy())
+def replace_residue_atoms(dst_res, src_res):
+    """
+    Replace all atoms in dst_res with deep copies from src_res so coordinates,
+    occupancies and B-factors mirror the PLACER fragment.
+    """
+    removed = 0
+    for atom in list(dst_res.get_atoms()):
+        dst_res.detach_child(atom.id)
+        removed += 1
 
-def prune_to_backbone_and_update(dst_res, src_res):
-    # 1) drop all sidechain atoms (keep only backbone set + CB if present in src)
-    keep = set(BACKBONE)
-    src_names = {a.get_name().strip() for a in src_res.get_atoms()}
-    if "CB" in src_names:
-        keep.add("CB")
-    # collect atoms to delete
-    to_del = []
-    for a in dst_res.get_atoms():
-        nm = a.get_name().strip()
-        if nm not in keep:
-            to_del.append(a)
-    for a in to_del:
-        parent = a.get_parent()
-        parent.detach_child(a.id)
+    added = 0
+    for atom in src_res.get_atoms():
+        dst_res.add(copy.deepcopy(atom))
+        added += 1
 
-    # 2) update kept atoms from src when available; if kept atom not in src, leave as-is
-    src_map = {a.get_name().strip(): a for a in src_res.get_atoms()}
-    updated = 0
-    for a in dst_res.get_atoms():
-        nm = a.get_name().strip()
-        if nm in src_map:
-            copy_xyz(a, src_map[nm]); updated += 1
-    return updated, len(to_del)
+    dst_res.resname = src_res.get_resname()
+    return added, removed
 
 class KeepAll(Select):
     def accept_atom(self, atom): return True
@@ -58,14 +44,13 @@ def main():
     p.add_argument("--base_dir", required=True)
     p.add_argument("--mode", choices=["tar","off"], required=True)
     p.add_argument("--target-chain", default="Z")  # ligand chain if you also want to treat HETATM
-    p.add_argument("--update-ligand", type=int, default=0)  # 1 to also update ligand atoms (chain Z)
     args = p.parse_args()
 
     subdirs = sorted([d for d in glob.glob(os.path.join(args.base_dir, "*"))])
     for sub in subdirs:
         cleaned_dir = os.path.join(sub, f"cleaned_{args.mode}")
-        split_dir   = os.path.join(sub, f"split_{args.mode}")
-        recover_dir = os.path.join(sub, f"recover_{args.mode}")
+        split_dir   = os.path.join(sub, f"split_{args.mode}_large")
+        recover_dir = os.path.join(sub, f"recover_{args.mode}_large")
         if not (os.path.isdir(cleaned_dir) and os.path.isdir(split_dir)):
             continue
         os.makedirs(recover_dir, exist_ok=True)
@@ -98,7 +83,7 @@ def main():
             c_idx = build_index(cleaned)
             f_model = next(iter(frag))
 
-            updated_res, deleted_side, updated_atoms = 0, 0, 0
+            updated_res, removed_atoms, added_atoms = 0, 0, 0
 
             for f_chain in f_model:
                 for f_res in f_chain:
@@ -107,26 +92,21 @@ def main():
                     if c_res is None:
                         continue
                     if not is_het(f_res):
-                        ua, ds = prune_to_backbone_and_update(c_res, f_res)
-                        updated_atoms += ua
-                        deleted_side  += ds
+                        added, removed = replace_residue_atoms(c_res, f_res)
+                        added_atoms   += added
+                        removed_atoms += removed
                         updated_res   += 1
                     else:
-                        if not args.update_ligand:
-                            continue
                         if f_chain.id != args.target_chain:
                             continue
-                        # For ligand: replace coords for common atom names only, do not change residue name
-                        src_map = {a.get_name().strip(): a for a in f_res.get_atoms()}
-                        for a in c_res.get_atoms():
-                            nm = a.get_name().strip()
-                            if nm in src_map:
-                                copy_xyz(a, src_map[nm]); updated_atoms += 1
-                        updated_res += 1
+                        added, removed = replace_residue_atoms(c_res, f_res)
+                        added_atoms   += added
+                        removed_atoms += removed
+                        updated_res   += 1
 
             io.set_structure(cleaned)
             io.save(out_path, select=KeepAll())
-            print(f"[recover] {frag_path} -> {out_path} | residues={updated_res}, atoms_updated={updated_atoms}, sidechain_deleted={deleted_side}")
+            print(f"[recover] {frag_path} -> {out_path} | residues={updated_res}, atoms_added={added_atoms}, atoms_removed={removed_atoms}")
 
         print("[recover] done.")
 
