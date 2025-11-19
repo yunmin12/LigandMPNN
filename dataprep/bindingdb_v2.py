@@ -17,11 +17,11 @@ p.add_argument("--same_mutation", dest="same_mutation", required=False, default=
 args = p.parse_args()
 
 if args.input_tsv == "articles":
-    INPUT_TSV = "/home/yunmin/proj/data/db/BindingDB_BindingDB_Articles.tsv"
+    INPUT_TSV = "/scratch/yunmin/data/db/BindingDB_BindingDB_Articles.tsv"
 elif args.input_tsv == "all":
-    INPUT_TSV = "/home/yunmin/proj/data/db/BindingDB_All.tsv"
+    INPUT_TSV = "/scratch/yunmin/data/db/BindingDB_All.tsv"
 OUTPUT_CSV = args.output_path
-# OUTPUT_CSV = "/home/yunmin/proj/data/db/15_eval_set_1015.csv"
+# OUTPUT_CSV = "/scratch/yunmin/data/db/15_eval_set_1015.csv"
 SOLVENT_IDS = {
     "HOH","WAT","DOD",  # water
     "CL","NA","K","CA","MG","ZN","MN","CO","CU","NI","IOD",  # common ions

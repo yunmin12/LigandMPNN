@@ -15,9 +15,9 @@ from pathlib import Path
 # p.add_argument("--same_mutation", dest="same_mutation", required=False, default=False, help="Remains off-targets that only has the same key_mutation with the target. Default: False.")
 # args = p.parse_args()
 
-INPUT_TSV = "/home/yunmin/proj/data/db/BindingDB_All.tsv"
+INPUT_TSV = "/scratch/yunmin/data/db/BindingDB_All.tsv"
 # OUTPUT_CSV = args.output_path
-OUTPUT_CSV = "/home/yunmin/proj/data/db/15_eval_set_all_mitigated.csv"
+OUTPUT_CSV = "/scratch/yunmin/data/db/15_eval_set_all_mitigated.csv"
 SOLVENT_IDS = {
     "HOH","WAT","DOD",  # water
     "CL","NA","K","CA","MG","ZN","MN","CO","CU","NI","IOD",  # common ions
