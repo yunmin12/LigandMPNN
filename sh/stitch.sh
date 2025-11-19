@@ -14,7 +14,7 @@ for i in {0..4}; do
 	  ' "$in"
 	  printf "%s: %d\n" "$split_dir" "$(ls -1 "$split_dir"/*.pdb 2>/dev/null | wc -l)"
 	  python /home/yunmin/proj/LigandMPNN/scripts/stitch.py \
-		--full_pdb /home/yunmin/proj/data/placer/${protein}/sub_test_${i}.pdb \
-		--split_dir /home/yunmin/proj/data/placer/${protein}/outputs/split_${i} \
-		--out_dir /home/yunmin/proj/data/input/0911/${protein};
+		--full_pdb /scratch/yunmin/data/placer/${protein}/sub_test_${i}.pdb \
+		--split_dir /scratch/yunmin/data/placer/${protein}/outputs/split_${i} \
+		--out_dir /scratch/yunmin/data/input/0911/${protein};
 done

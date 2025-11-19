@@ -1,5 +1,5 @@
 $sh_dir="/home/yunmin/proj/LigandMPNN/sh"
-$base_dir="/home/yunmin/proj/data/db/v2"
+$base_dir="/scratch/yunmin/data/db/v2"
 
 # 1. Clean target and off-target complex PDB
 bash $sh_dir/clean_hetatm.sh tar

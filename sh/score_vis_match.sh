@@ -1,4 +1,4 @@
-BASE_DIR="/home/yunmin/proj/data/db/v2"
+BASE_DIR="/scratch/yunmin/data/db/v2"
 OUT_DIR="$1"
 PREFIX="$2"
 KEY_MUT="$3"

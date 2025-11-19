@@ -12,7 +12,7 @@ slurm_start $SLURM_CHANNEL_ID
 ###############################################
 set -euo pipefail
 
-base_dir="/home/yunmin/proj/data/db/v2"
+base_dir="/scratch/yunmin/data/db/v2"
 mode="${1:?mode required: tar|off}"
 
 shopt -s nullglob

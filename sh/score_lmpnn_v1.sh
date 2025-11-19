@@ -13,7 +13,7 @@ slurm_start $SLURM_CHANNEL_ID
 ###############################################
 set -euo pipefail
 
-BASE=/home/yunmin/proj/data/db/v2
+BASE=/scratch/yunmin/data/db/v2
 IN_OFF_DIR="${BASE}/lmpnn_in_off"
 OUT_DIR=${1:-lmpnn_out_1028_v1}
 

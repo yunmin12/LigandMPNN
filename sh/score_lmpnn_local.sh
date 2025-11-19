@@ -11,7 +11,7 @@ source /apps/.slurmrc
 slurm_start $SLURM_CHANNEL_ID
 ###############################################
 #protein="$1"
-BASE=/home/yunmin/proj/data/bench
+BASE=/scratch/yunmin/data/bench
 INPUT="$BASE/outputs/1001/packed"
 OUT="$BASE/outputs/1001/scores"
 

@@ -10,7 +10,7 @@
 source /apps/.slurmrc
 slurm_start $SLURM_CHANNEL_ID
 ###############################################
-BASE=/home/yunmin/proj/data/bench
+BASE=/scratch/yunmin/data/bench
 INPUT="$BASE/inputs/trimmed_pdb"
 OUT="$BASE/outputs/1001"
 

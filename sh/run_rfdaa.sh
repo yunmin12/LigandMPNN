@@ -18,7 +18,7 @@ rfdiffusion \
     inference.deterministic=False \
     diffuser.T=30 \
     inference.output_prefix=${outdir}/output \
-    inference.input_pdb=/home/yunmin/proj/data/rfdaa/${outdir}/${pdb}_trimmed.pdb \
+    inference.input_pdb=/scratch/yunmin/data/rfdaa/${outdir}/${pdb}_trimmed.pdb \
     contigmap.contigs=[\'${contig}-${contig}\'] \
     inference.ligand=${lig} \
     inference.num_designs=5 \

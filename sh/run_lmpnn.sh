@@ -11,7 +11,7 @@ source /apps/.slurmrc
 slurm_start $SLURM_CHANNEL_ID
 ###############################################
 protein="$1"
-BASE=/home/yunmin/proj/data/lmpnn
+BASE=/scratch/yunmin/data/lmpnn
 #IMG=/home/yunmin/proj/LigandMPNN/mlfold.sif
 INPUT="$BASE/$protein/inputs"
 OUT="$BASE/$protein/outputs/0916"

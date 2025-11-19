@@ -1,5 +1,5 @@
 TARGET_CHAIN="Z"
-base_dir="/home/yunmin/proj/data/db/v2"
+base_dir="/scratch/yunmin/data/db/v2"
 
 target="$1"
 pattern="standard"

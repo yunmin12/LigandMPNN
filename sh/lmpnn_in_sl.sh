@@ -1,6 +1,6 @@
 set -euo pipefail
 
-BASE="/home/yunmin/proj/data/db/v2"
+BASE="/scratch/yunmin/data/db/v2"
 process_csv () {
   local CSV="$1"
   local TTYPE="$2"
