@@ -89,6 +89,9 @@ def extract_dist_cst_from_pdb_use_allatm(pdb_in,ptm_resname,bsite_res=''):
         #
         het_CA_d = {}
         for resno in bsite_res_s:
+            if resno not in bsite_CA_R:
+                print(f"[WARN] Skipping resno {resno} which is not in bsite_CA_R")
+                continue
             CA_R = bsite_CA_R[resno]
             d = dist_two_coords(het_R,CA_R)
             het_CA_d[resno] = d
