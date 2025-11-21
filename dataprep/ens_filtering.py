@@ -57,7 +57,7 @@ def _load_threshold_overrides(csv_path: str) -> Dict[str, Tuple[Optional[float],
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--base_dir", required=True)
+    p.add_argument("--base_dir", default=".")
     p.add_argument("--type", choices=["tar", "off"], required=True)
     p.add_argument("--rmsd", type=float, default=None,
                    help="Default maximum RMSD allowed during filtering (Å).")
@@ -91,8 +91,8 @@ def main():
 
     subdirs = sorted([d for d in glob.glob(os.path.join(args.base_dir, "*"))])
     for sub in subdirs:
-        placer_dir = os.path.join(sub, f"placer_{args.type}_large")
-        filter_dir = os.path.join(sub, f"filter_{args.type}_large")
+        placer_dir = os.path.join(sub, f"placer_{args.type}")
+        filter_dir = os.path.join(sub, f"filter_{args.type}")
 
         if not os.path.isdir(placer_dir):
             continue
@@ -124,7 +124,7 @@ def main():
 
             # Save filtered csv
             stem = os.path.splitext(os.path.basename(file))[0]
-            filter_path = os.path.join(filter_dir, stem + "_filtered_large.csv")
+            filter_path = os.path.join(filter_dir, stem + "_filtered.csv")
             filtered_df.to_csv(filter_path, index=False)
             log_msg = f"[{args.type}] {os.path.basename(file)} ({len(filtered_df)}/{len(df)})"
             log_msg += f" rmsd≤{file_rmsd:.2f}"
@@ -133,13 +133,13 @@ def main():
             print(log_msg)
 
             rank_df = rank_by_rmsd(filtered_df, topk=topk)
-            rank_path = os.path.join(filter_dir, stem + "_ranked_large.csv")
+            rank_path = os.path.join(filter_dir, stem + "_ranked.csv")
             rank_df.to_csv(rank_path, index=False, float_format="%.4f")
 
             # Summary csv
-            filtered_idx_list = filtered_df.index.to_list()  # PDB MODEL is 0-based
+            filtered_idx_list = (filtered_df.index + 1).to_list()  # PDB MODEL is 0-based -> 1-based
             filtered_indices_str = ",".join(map(str, filtered_idx_list))
-            ranked_idx_list = rank_df.index.to_list()
+            ranked_idx_list = (rank_df.index + 1).to_list()
             ranked_indices_str = ",".join(map(str, ranked_idx_list))
 
             summary_rows.append({
@@ -159,7 +159,7 @@ def main():
             "ranked_count", "ranked_model_indices",
             "rmsd_threshold", "plddt_threshold",
         ])
-        summary_path = os.path.join(args.base_dir, f"ensemble_{args.type}_summary_large.csv")
+        summary_path = os.path.join(args.base_dir, f"ensemble_{args.type}_summary.csv")
         summary_df.to_csv(summary_path, index=False)
         print(f"Summary csv is saved as {summary_path}")
     else:
