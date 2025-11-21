@@ -230,23 +230,23 @@ def main():
         base_mm.set_jump(lig_jump, True)
 
         # rigid-body perturb mover for randomness
-        trans_mag = 0.1  # translation pertubation
-        rot_mag = 1.0 # rotation perturbation
+        trans_mag = 0.2  # translation pertubation
+        rot_mag = 2.0 # rotation perturbation
         rb_pert = RigidBodyPerturbMover(lig_jump, trans_mag, rot_mag)
 
         # local backbone randomization movers
-        kT = 0.7
+        kT = 0.5
         n_moves = 5
 
         small_mover = SmallMover(base_mm, kT, n_moves)
         shear_mover = ShearMover(base_mm, kT, n_moves)
 
-        small_mover.angle_max( 'H', 1.0 )   # helix
-        small_mover.angle_max( 'E', 1.0 )   # sheet
-        small_mover.angle_max( 'L', 2.5 )   # loop
-        shear_mover.angle_max( 'H', 1.0 )
-        shear_mover.angle_max( 'E', 1.0 )
-        shear_mover.angle_max( 'L', 2.5 )
+        small_mover.angle_max( 'H', 2.0 )   # helix
+        small_mover.angle_max( 'E', 2.0 )   # sheet
+        small_mover.angle_max( 'L', 5.0 )   # loop
+        shear_mover.angle_max( 'H', 2.0 )
+        shear_mover.angle_max( 'E', 2.0 )
+        shear_mover.angle_max( 'L', 5.0 )
 
         # Pre-score original
         E0 = sf(pose0)
@@ -307,6 +307,7 @@ def main():
                 "seed": args.seed,
                 "n_protein_res": n_aa,
                 "shell_size": shell_size,
+                "shell": shell, 
                 "lig_jump": lig_jump,
                 "E_before": float(E0),
                 "E_after": float(E),
