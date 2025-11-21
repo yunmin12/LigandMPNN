@@ -255,7 +255,7 @@ def process_group(gdf: pd.DataFrame, protein_key: str, out_dir: str, summary_row
 
     # ---------- Only when target complex PDB exists ----------
     for basis_id in sorted(target_pdb_ids):
-        basis_path = os.path.join(complex_dir, "target", f"{basis_id}.pdb")
+        basis_path = os.path.join(complex_dir, "pdb_tar", f"{basis_id}.pdb")
         if not os.path.exists(basis_path):
             warn(basis_id, "", "Basis PDB not found on disk.")
             continue
