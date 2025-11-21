@@ -118,31 +118,62 @@ def main(args) -> None:
         model_sc.to(device)
         model_sc.eval()
 
+    def _canonicalize_path(path_value):
+        if path_value is None:
+            return ""
+        path_value = str(path_value).strip()
+        if not path_value:
+            return ""
+        return os.path.abspath(os.path.expanduser(path_value))
+
+    def _load_and_canonicalize_pdb_paths(path_arg, multi_arg):
+        if multi_arg:
+            with open(multi_arg, "r") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                entries = list(loaded.keys())
+            else:
+                entries = list(loaded)
+        else:
+            entries = [path_arg]
+        return [_canonicalize_path(entry) for entry in entries if entry]
+
+    def _canonicalize_mapping_keys(mapping):
+        return {_canonicalize_path(key): value for key, value in mapping.items()}
+
     if args.pdb_path_multi:
-        with open(args.pdb_path_multi, "r") as fh:
-            pdb_paths = list(json.load(fh))
+        pdb_paths = _load_and_canonicalize_pdb_paths(args.pdb_path, args.pdb_path_multi)
     else:
-        pdb_paths = [args.pdb_path]
+        pdb_paths = _load_and_canonicalize_pdb_paths(args.pdb_path, "")
+
+    def _ensure_list(value):
+        if isinstance(value, str):
+            return value.split()
+        if isinstance(value, list):
+            return value
+        return list(value)
 
     if args.fixed_residues_multi:
         with open(args.fixed_residues_multi, "r") as fh:
-            fixed_residues_multi = json.load(fh)
-            fixed_residues_multi = {key:value.split() for key,value in fixed_residues_multi.items()}
+            fixed_raw = json.load(fh)
+        fixed_residues_multi = {
+            _canonicalize_path(key): _ensure_list(value)
+            for key, value in fixed_raw.items()
+        }
     else:
         fixed_residues = [item for item in args.fixed_residues.split()]
-        fixed_residues_multi = {}
-        for pdb in pdb_paths:
-            fixed_residues_multi[pdb] = fixed_residues
+        fixed_residues_multi = {pdb: fixed_residues for pdb in pdb_paths}
 
     if args.redesigned_residues_multi:
         with open(args.redesigned_residues_multi, "r") as fh:
-            redesigned_residues_multi = json.load(fh)
-            redesigned_residues_multi = {key:value.split() for key,value in redesigned_residues_multi.items()}
+            redesigned_raw = json.load(fh)
+        redesigned_residues_multi = {
+            _canonicalize_path(key): _ensure_list(value)
+            for key, value in redesigned_raw.items()
+        }
     else:
         redesigned_residues = [item for item in args.redesigned_residues.split()]
-        redesigned_residues_multi = {}
-        for pdb in pdb_paths:
-            redesigned_residues_multi[pdb] = redesigned_residues
+        redesigned_residues_multi = {pdb: redesigned_residues for pdb in pdb_paths}
 
     bias_AA = torch.zeros([21], device=device, dtype=torch.float32)
     if args.bias_AA:
@@ -154,29 +185,27 @@ def main(args) -> None:
 
     if args.bias_AA_per_residue_multi:
         with open(args.bias_AA_per_residue_multi, "r") as fh:
-            bias_AA_per_residue_multi = json.load(
-                fh
+            bias_AA_per_residue_multi = _canonicalize_mapping_keys(
+                json.load(fh)
             )  # {"pdb_path" : {"A12": {"G": 1.1}}}
     else:
         if args.bias_AA_per_residue:
             with open(args.bias_AA_per_residue, "r") as fh:
                 bias_AA_per_residue = json.load(fh)  # {"A12": {"G": 1.1}}
-            bias_AA_per_residue_multi = {}
-            for pdb in pdb_paths:
-                bias_AA_per_residue_multi[pdb] = bias_AA_per_residue
+            bias_AA_per_residue_multi = {pdb: bias_AA_per_residue for pdb in pdb_paths}
 
     if args.omit_AA_per_residue_multi:
         with open(args.omit_AA_per_residue_multi, "r") as fh:
-            omit_AA_per_residue_multi = json.load(
-                fh
+            omit_AA_per_residue_multi = _canonicalize_mapping_keys(
+                json.load(fh)
             )  # {"pdb_path" : {"A12": "PQR", "A13": "QS"}}
     else:
         if args.omit_AA_per_residue:
             with open(args.omit_AA_per_residue, "r") as fh:
                 omit_AA_per_residue = json.load(fh)  # {"A12": "PG"}
-            omit_AA_per_residue_multi = {}
-            for pdb in pdb_paths:
-                omit_AA_per_residue_multi[pdb] = omit_AA_per_residue
+            omit_AA_per_residue_multi = {
+                pdb: omit_AA_per_residue for pdb in pdb_paths
+            }
     omit_AA_list = args.omit_AA
     omit_AA = torch.tensor(
         np.array([AA in omit_AA_list for AA in alphabet]).astype(np.float32),
@@ -199,7 +228,11 @@ def main(args) -> None:
         if isinstance(raw_value, str):
             if raw_value.strip() == "":
                 return []
-            return [item.strip() for item in raw_value.split(",") if item.strip()]
+            return [
+                _canonicalize_path(item.strip())
+                for item in raw_value.split(",")
+                if item.strip()
+            ]
         raise ValueError(f"Unsupported off-target entry type: {type(raw_value)}")
 
     def _compute_auto_pocket_mask(feature_dict, cutoff_radius):
@@ -237,9 +270,14 @@ def main(args) -> None:
     off_target_map = {pdb: list(combined_global_off_targets) for pdb in pdb_paths}
     if args.off_target_pdb_path_multi:
         with open(args.off_target_pdb_path_multi, "r") as fh:
-            off_target_multi = json.load(fh)
+            off_target_multi_raw = json.load(fh)
+        off_target_multi = {
+            _canonicalize_path(key): value for key, value in off_target_multi_raw.items()
+        }
         for key, value in off_target_multi.items():
-            combined = off_target_map.get(key, list(combined_global_off_targets)) + _normalize_off_target_list(value)
+            combined = off_target_map.get(
+                key, list(combined_global_off_targets)
+            ) + _normalize_off_target_list(value)
             off_target_map[key] = list(dict.fromkeys(combined))
 
 
@@ -507,6 +545,8 @@ def main(args) -> None:
                 off_feature_dicts.append(off_feature_dict)
 
             feature_dict["off_target_features"] = off_feature_dicts
+            if args.verbose:
+                print(f"[Info] Attached {len(off_feature_dicts)} off-target structure(s) to {pdb}")
             mask_components = []
             if args.auto_pocket:
                 auto_mask = _compute_auto_pocket_mask(feature_dict, args.auto_pocket_cutoff)
