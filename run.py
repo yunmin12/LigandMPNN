@@ -43,6 +43,11 @@ def main(args) -> None:
         base_folder = base_folder + "/"
     if not os.path.exists(base_folder):
         os.makedirs(base_folder, exist_ok=True)
+    pocket_log_path = None
+    if args.auto_pocket:
+        pocket_log_path = os.path.join(base_folder, "auto_pocket_residues.tsv")
+        with open(pocket_log_path, "w") as fh:
+            fh.write("pdb\tresidues\n")
     if not os.path.exists(base_folder + "seqs"):
         os.makedirs(base_folder + "seqs", exist_ok=True)
     if not os.path.exists(base_folder + "backbones"):
@@ -552,6 +557,23 @@ def main(args) -> None:
                 auto_mask = _compute_auto_pocket_mask(feature_dict, args.auto_pocket_cutoff)
                 if auto_mask is not None:
                     mask_components.append(auto_mask)
+                    picked_idx = (
+                        (auto_mask[0] > 0)
+                        .nonzero(as_tuple=False)
+                        .flatten()
+                        .tolist()
+                    )
+                    pocket_labels = [encoded_residue_dict_rev[i] for i in picked_idx]
+                    if args.verbose:
+                        print(
+                            f"[auto_pocket] {os.path.basename(pdb)} residues: "
+                            + (", ".join(pocket_labels) if pocket_labels else "none")
+                        )
+                    if pocket_log_path:
+                        with open(pocket_log_path, "a") as fh:
+                            fh.write(
+                                f"{os.path.basename(pdb)}\t{','.join(pocket_labels)}\n"
+                            )
                 else:
                     if args.verbose:
                         print("[Warning] auto pocket requested but ligand context absent; falling back to full mask.")
@@ -576,8 +598,6 @@ def main(args) -> None:
 
             target_weight = float(args.target_logit_weight)
             off_weight = float(args.off_target_logit_weight)
-            if getattr(args, "negative_enable", 0):
-                off_weight = float(args.negative_weight)
             feature_dict["target_weight"] = target_weight
             feature_dict["off_target_weight"] = off_weight
 
@@ -1003,18 +1023,6 @@ if __name__ == "__main__":
         action="append",
         default=None,
         help="Legacy repeatable flag for off-target PDBs; kept for backward compatibility.",
-    )
-    argparser.add_argument(
-        "--negative_enable",
-        type=int,
-        default=0,
-        help="Compatibility toggle for legacy contrastive decoding logic.",
-    )
-    argparser.add_argument(
-        "--negative_weight",
-        type=float,
-        default=1.0,
-        help="Penalty weight when --negative_enable is set.",
     )
     argparser.add_argument(
         "--negative_residues",

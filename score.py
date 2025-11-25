@@ -419,8 +419,6 @@ def main(args) -> None:
 
             target_weight = float(args.target_logit_weight)
             off_weight = float(args.off_target_logit_weight)
-            if getattr(args, "negative_enable", 0):
-                off_weight = float(args.negative_weight)
             feature_dict["target_weight"] = target_weight
             feature_dict["off_target_weight"] = off_weight
 
@@ -583,18 +581,6 @@ if __name__ == "__main__":
         action="append",
         default=None,
         help="Legacy repeatable flag for off-target PDBs; kept for backward compatibility.",
-    )
-    argparser.add_argument(
-        "--negative_enable",
-        type=int,
-        default=0,
-        help="Compatibility toggle for legacy contrastive scoring.",
-    )
-    argparser.add_argument(
-        "--negative_weight",
-        type=float,
-        default=1.0,
-        help="Penalty weight when --negative_enable is set.",
     )
     argparser.add_argument(
         "--negative_residues",
