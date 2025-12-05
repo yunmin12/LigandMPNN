@@ -19,7 +19,7 @@ slurm_start $SLURM_CHANNEL_ID
 ###############################################
 set -euo pipefail
 
-BASE_DIR="${BASE_DIR:-/scratch/yunmin/data/db/v2/fastrelax/P00533_L858R}"
+BASE_DIR="${BASE_DIR:-/scratch/yunmin/data/db/PYR1}"
 OUT_PRT_DIR="${1:-lmpnn_out_1104_v2}"
 OUT_ROOT="${BASE_DIR}/${OUT_PRT_DIR}"
 mkdir -p "$OUT_ROOT"
@@ -30,7 +30,6 @@ PACK_SC=1
 PACKS_PER=1
 PACK_WITH_LIG=1
 TEMP=0.3
-NEG_ENABLE=1
 TAR_WEIGHT=1.0
 NEG_WEIGHT="$2"
 NEG_RES=""
@@ -43,8 +42,11 @@ echo "[INFO] BASE_DIR=$BASE_DIR"
 shopt -s nullglob
 OUT_DIR="${OUT_ROOT}/lmpnn_mod"
 mkdir -p "$OUT_DIR"
-for TGT in "${BASE_DIR}"/lmpnn_in_tar/*.pdb; do
-  OFF_DIR="${BASE_DIR}"/lmpnn_in_off
+files=("${BASE_DIR}"/lmpnn_in_tar_wt/*.pdb)
+n_total="${#files[@]}"
+cnt=0
+for TGT in "${BASE_DIR}"/lmpnn_in_tar_wt/*.pdb; do
+  OFF_DIR="${BASE_DIR}"/lmpnn_in_off_wt
   OFFS=( "$OFF_DIR"/*.pdb )
   if (( ${#OFFS[@]} == 0 )); then
     echo "[WARN] no off-target ensemble for target: "$(basename $TGT)""
@@ -54,7 +56,9 @@ for TGT in "${BASE_DIR}"/lmpnn_in_tar/*.pdb; do
       
   OFF_ARGS=()
   for off in "${OFFS[@]}"; do OFF_ARGS+=( --offtarget_pdb_path "$off" ); done
-  echo "➡️ [RUN] target=$(basename "$TGT")"
+  
+  cnt=$((cnt + 1))
+  echo "➡️ [RUN] target=$(basename "$TGT") ($cnt/$n_total)"
   if ! python /home/yunmin/proj/LigandMPNN/run.py \
     --seed "$SEED" \
     --model_type "ligand_mpnn" \
@@ -65,7 +69,6 @@ for TGT in "${BASE_DIR}"/lmpnn_in_tar/*.pdb; do
     --number_of_packs_per_design "$PACKS_PER" \
     --pack_with_ligand_context "$PACK_WITH_LIG" \
     --temperature "$TEMP" \
-    --negative_enable "$NEG_ENABLE" \
     --target_logit_weight "$TAR_WEIGHT" \
     --off_target_logit_weight "$NEG_WEIGHT" \
     --negative_residues "$NEG_RES" \
