@@ -46,8 +46,6 @@ def main(args) -> None:
     pocket_log_path = None
     if args.auto_pocket:
         pocket_log_path = os.path.join(base_folder, "auto_pocket_residues.tsv")
-        with open(pocket_log_path, "w") as fh:
-            fh.write("pdb\tresidues\n")
     if not os.path.exists(base_folder + "seqs"):
         os.makedirs(base_folder + "seqs", exist_ok=True)
     if not os.path.exists(base_folder + "backbones"):
@@ -253,17 +251,22 @@ def main(args) -> None:
         Y_m = feature_dict["Y_m"][0]
         if Y.numel() == 0 or torch.sum(Y_m) == 0:
             return None
+        # atom coordinates of N, CA, C atoms
         N = X[:, 0, :]
         CA = X[:, 1, :]
         C = X[:, 2, :]
+        # compute vectors for CB construction
         b = CA - N
         c = C - CA
         a = torch.cross(b, c, dim=-1)
+        # atom coordinates of CB atoms (computed from N, CA, C geometry)
         CB = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + CA
+        # compute distances from each residue CB to each ligand atom
         diff = Y - CB[:, None, :]
         distances = torch.linalg.norm(diff, dim=-1)
         distances = distances.masked_fill(Y_m == 0, float("inf"))
         min_distances = torch.min(distances, dim=-1).values
+        # compute pocket mask (assigned as pocket if distance from ligand is within cutoff radius)
         pocket_mask = ((min_distances <= cutoff_radius) & torch.isfinite(min_distances)).float() * mask
         return pocket_mask.unsqueeze(0)
 
@@ -570,10 +573,15 @@ def main(args) -> None:
                             + (", ".join(pocket_labels) if pocket_labels else "none")
                         )
                     if pocket_log_path:
-                        with open(pocket_log_path, "a") as fh:
-                            fh.write(
-                                f"{os.path.basename(pdb)}\t{','.join(pocket_labels)}\n"
-                            )
+                        file_exists = os.path.exists(pocket_log_path)
+                        try:
+                            with open(pocket_log_path, "a") as fh:
+                                if not file_exists:
+                                    fh.write("pdb\tresidues\n")  # write header only if it is new file
+                                fh.write(f"{os.path.basename(pdb)}\t{','.join(pocket_labels)}\n")
+                                fh.flush()
+                        except Exception as e:
+                            print(f"[Warning] failed to log auto pocket residues for {pdb}: {e}")
                 else:
                     if args.verbose:
                         print("[Warning] auto pocket requested but ligand context absent; falling back to full mask.")
@@ -591,10 +599,14 @@ def main(args) -> None:
                     manual_mask[:, idxs] = 1.0
                     mask_components.append(manual_mask)
             if mask_components:
-                penalty_mask_tensor = torch.ones((1, L), dtype=torch.float32, device=device)
+                penalty_mask_tensor = torch.zeros((1, L), dtype=torch.float32, device=device)
                 for mask_component in mask_components:
-                    penalty_mask_tensor = penalty_mask_tensor * mask_component
+                    # penalty_mask_tensor = penalty_mask_tensor * mask_component
+                    penalty_mask_tensor = torch.max(penalty_mask_tensor, mask_component)
                 feature_dict["off_target_residue_mask"] = penalty_mask_tensor
+
+                final_positions = penalty_mask_tensor.nonzero()[:, 1].tolist()
+                print(f"[DEBUG] Final combined mask positions: {final_positions}", flush=True)
 
             target_weight = float(args.target_logit_weight)
             off_weight = float(args.off_target_logit_weight)
