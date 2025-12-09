@@ -868,7 +868,6 @@ def main():
     create_integrated_variability_plot(all_variabilities, pocket_positions, reference_seq, args.output_dir, labels)
     create_summary_comparison_plot(all_dir_metrics, all_variabilities, pocket_positions, args.output_dir, labels)
 
-    ### Create baseline comparison plots (looks for "tar" as baseline)
     print("\n=== Creating baseline comparison plots ===")
     if "tar" in args.dir_labels and "mod" in args.dir_labels:
         print("Baseline 'tar' and modified 'mod' methods detected in labels.")
