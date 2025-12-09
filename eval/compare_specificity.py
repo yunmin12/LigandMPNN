@@ -1,105 +1,115 @@
 import argparse
-import copy
 import json
 import os
 import re
-from collections import Counter
-from collections import defaultdict
-from pathlib import Path
-
 import sys
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+from collections import Counter, defaultdict
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 
-from data_utils import (
-    alphabet,
-    featurize,
-    parse_PDB,
-    restype_int_to_str,
-)
+# Ensure the parent directory is in the path
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
+from data_utils import alphabet, featurize, parse_PDB, restype_int_to_str
 
 AA_LABELS = alphabet[:20]
 MUTATION_PATTERN = re.compile(
     r"^(?:(?P<chain>[A-Za-z]+):)?(?P<orig>[A-Z])?(?P<resnum>\d+)(?P<mut>[A-Z])?$"
 )
 
+
 def load_score_directory(directory: Path):
+    """
+    Load all .pt files from a directory and group by stem.
+    Returns a dict: stem -> list of loaded tensors/dicts.
+    """
     records = {}
     for path in directory.rglob("*.pt"):
         try:
             payload = torch.load(path, map_location="cpu")
+            records.setdefault(path.stem, []).append(payload)
         except Exception:
             continue
-        key = path.stem
-        records.setdefault(key, []).append(payload)
     return records
 
 
-def average_all_entries(records):
-    combined = []
-    for entries in records.values():
-        combined.extend(entries)
-    if not combined:
-        return None
-    return average_entries(combined)
-
-
 def to_list_from_mapping(mapping):
+    """
+    Convert a mapping (dict or list) to an ordered list.
+    If dict, sort by integer keys.
+    """
     if isinstance(mapping, dict):
         items = sorted(((int(k), v) for k, v in mapping.items()), key=lambda x: x[0])
         return [v for _, v in items]
-    if isinstance(mapping, (list, tuple)):
-        return list(mapping)
-    raise ValueError("Unsupported residue_names structure")
+    return list(mapping) if isinstance(mapping, (list, tuple)) else []
 
 
-def average_entries(entries):
+def average_score_entries(entries):
+    """
+    Average multiple score entries (from different batches/runs).
+    Returns a single dict with averaged logits, native_sequence, and residue_names.
+    """
+    if not entries:
+        return None
+
+    # Average logits
     logits_stack = []
     for entry in entries:
         logits = torch.as_tensor(entry["logits"], dtype=torch.float32)
         if logits.dim() == 3:
+            # Shape: [B, L, 21] → average over B
             logits_stack.append(logits.mean(dim=0))
         else:
             raise ValueError("Logits tensor must have shape [B, L, 21]")
-    logits_mean = torch.stack(logits_stack).mean(dim=0)
-    log_probs = torch.as_tensor(entries[0]["log_probs"], dtype=torch.float32)
-    if log_probs.dim() == 3:
-        log_probs_mean = log_probs.mean(dim=0)
-    else:
-        log_probs_mean = log_probs
-    native_sequence = entries[0].get("native_sequence")
-    if native_sequence is None:
-        native_sequence = entries[0].get("S")
+
+    logits_mean = torch.stack(logits_stack).mean(dim=0)  # [L, 21]
+
+    # Get other data from first entry
+    first_entry = entries[0]
+    native_sequence = first_entry.get("native_sequence") or first_entry.get("S")
     native_sequence = torch.as_tensor(native_sequence, dtype=torch.int64).tolist()
-    residue_names = to_list_from_mapping(entries[0]["residue_names"])
+
     return {
         "logits": logits_mean,
-        "log_probs": log_probs_mean,
         "native_sequence": native_sequence,
-        "residue_names": residue_names,
+        "residue_names": to_list_from_mapping(first_entry["residue_names"]),
     }
 
 
+def average_all_entries(records):
+    """
+    Average all entries across all keys in records.
+    """
+    all_entries = []
+    for entries in records.values():
+        all_entries.extend(entries)
+    return average_score_entries(all_entries) if all_entries else None
+
+
 def parse_mutation_label(label: str, residue_names):
+    """
+    Parse mutation label (e.g., '123Y', 'A:123Y', 'A:123') to find residue index.
+    """
     match = MUTATION_PATTERN.match(label)
     if not match:
         raise ValueError(f"Unable to parse mutation label '{label}'")
+
     chain_hint = match.group("chain")
     resnum = match.group("resnum")
+
     candidates = []
     for idx, name in enumerate(residue_names):
         if name is None:
             continue
-        chain = ""
-        digits = ""
-        icode = ""
+
+        # Parse residue name (e.g., 'A123' or 'A123A')
+        chain, digits, icode = "", "", ""
         for ch in name:
             if ch.isalpha() and not digits:
                 chain += ch
@@ -107,25 +117,70 @@ def parse_mutation_label(label: str, residue_names):
                 digits += ch
             else:
                 icode += ch
+
         if digits == resnum and (chain_hint is None or chain_hint == chain):
             candidates.append(idx)
+
     if len(candidates) == 1:
         return candidates[0]
-    if len(candidates) == 0:
-        raise ValueError(f"Residue {label} not found in residue list")
-    raise ValueError(f"Residue {label} is ambiguous; specify chain explicitly")
+    elif len(candidates) == 0:
+        raise ValueError(f"Residue {label} not found")
+    else:
+        raise ValueError(f"Residue {label} is ambiguous; specify chain")
 
 
-def extract_mutation_target_aa(label: str):
+def extract_target_aa(label: str):
+    """
+    Extract target amino acid from mutation label.
+    """
     match = MUTATION_PATTERN.match(label)
-    if not match:
-        raise ValueError(f"Unable to parse mutation label '{label}'")
-    mut = match.group("mut")
-    if mut:
-        return mut.upper()
+    if match and match.group("mut"):
+        return match.group("mut").upper()
     return None
 
+
+def compute_mutation_success(entries, site_idx: int, target_aa: str):
+    """
+    Compute mutation success rates.
+    """
+    aa_to_idx = {aa: i for i, aa in enumerate(AA_LABELS)}
+    target_idx = aa_to_idx.get(target_aa.upper())
+    if target_idx is None:
+        raise ValueError(f"Unknown amino acid '{target_aa}'")
+
+    top1_match = top3_match = total = 0
+    top1_counts = Counter()
+
+    for entry in entries:
+        logits = torch.as_tensor(entry["logits"], dtype=torch.float32)
+        if logits.dim() != 3 or site_idx >= logits.shape[1]:
+            continue
+
+        slice_logits = logits[:, site_idx, : len(AA_LABELS)]
+        for row in slice_logits:
+            total += 1
+            top1_idx = int(torch.argmax(row).item())
+            top1_counts[AA_LABELS[top1_idx]] += 1
+
+            if top1_idx == target_idx:
+                top1_match += 1
+
+            topk = torch.topk(row, k=min(3, row.numel()), dim=-1).indices.tolist()
+            if target_idx in topk:
+                top3_match += 1
+
+    return {
+        "top1_match": top1_match,
+        "top3_match": top3_match,
+        "total": total,
+        "top1_counter": top1_counts,
+    }
+
+
 def compute_pocket_indices(pdb_path: Path, cutoff: float):
+    """
+    Compute pocket residue indices from PDB.
+    """
     protein_dict, _, _, icodes, _ = parse_PDB(
         str(pdb_path),
         device="cpu",
@@ -133,13 +188,12 @@ def compute_pocket_indices(pdb_path: Path, cutoff: float):
         parse_all_atoms=True,
         parse_atoms_with_zero_occupancy=False,
     )
+
+    # Set chain mask if missing
     if "chain_mask" not in protein_dict:
-        mask = protein_dict.get("mask")
-        if mask is not None:
-            protein_dict["chain_mask"] = mask.clone()
-        else:
-            length = len(protein_dict["R_idx"]) if "R_idx" in protein_dict else 0
-            protein_dict["chain_mask"] = torch.ones(length, dtype=torch.float32)
+        length = len(protein_dict.get("R_idx", []))
+        protein_dict["chain_mask"] = torch.ones(length, dtype=torch.float32)
+
     feature_dict = featurize(
         protein_dict,
         cutoff_for_score=cutoff,
@@ -147,88 +201,111 @@ def compute_pocket_indices(pdb_path: Path, cutoff: float):
         number_of_ligand_atoms=16,
         model_type="ligand_mpnn",
     )
+
     mask_xy = feature_dict.get("mask_XY")
     if mask_xy is None:
-        raise RuntimeError("Ligand context not found in PDB; cannot determine pocket residues")
+        raise RuntimeError(
+            "Ligand context not found; cannot determine pocket residues"
+        )
+
     mask_xy = mask_xy[0].cpu().numpy().astype(bool)
-    residue_names = []
+
+    # Build residue names
     R_idx_list = list(protein_dict["R_idx"].cpu().numpy())
     chain_letters = list(protein_dict["chain_letters"])
-    for idx, residue_idx in enumerate(R_idx_list):
-        residue_names.append(f"{chain_letters[idx]}{residue_idx}{icodes[idx]}")
+    residue_names = [
+        f"{chain_letters[i]}{R_idx_list[i]}{icodes[i]}"
+        for i in range(len(R_idx_list))
+    ]
+
     return np.where(mask_xy)[0], residue_names
 
 
-def ensure_output_dir(base: Path, sample: str):
-    out_dir = base / sample
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir
-
-
-def plot_key_site_bars(sample, mutation, datasets, output_dir):
-    fig, axes = plt.subplots(1, len(datasets), figsize=(5 * len(datasets), 4), sharey=True)
+def plot_mutation_bars(sample: str, mutation: str, datasets: dict, output_dir: Path):
+    """
+    Plot bar chart for mutation analysis.
+    """
+    fig, axes = plt.subplots(
+        1, len(datasets), figsize=(5 * len(datasets), 4), sharey=True
+    )
     if len(datasets) == 1:
         axes = [axes]
-    try:
-        highlight_aa = extract_mutation_target_aa(mutation)
-    except ValueError:
-        highlight_aa = None
+
+    highlight_aa = extract_target_aa(mutation)
+
     for ax, (label, logits) in zip(axes, datasets.items()):
         logits_array = np.asarray(logits, dtype=np.float32)
         aa_labels = AA_LABELS[: len(logits_array)]
-        color_list = ["skyblue"] * len(logits_array)
-        highlight_idx = None
-        if highlight_aa:
-            try:
-                highlight_idx = AA_LABELS.index(highlight_aa.upper())
-            except ValueError:
-                highlight_idx = None
-        if highlight_idx is not None and highlight_idx < len(color_list):
-            color_list[highlight_idx] = "blue"
+
+        # Color scheme: blue for target, red for max, skyblue for others
+        colors = ["skyblue"] * len(logits_array)
+
+        if highlight_aa and highlight_aa in AA_LABELS:
+            highlight_idx = AA_LABELS.index(highlight_aa)
+            if highlight_idx < len(colors):
+                colors[highlight_idx] = "blue"
+
         if len(logits_array) > 0:
             max_idx = int(np.argmax(logits_array))
-            color_list[max_idx] = "red"
-        x_pos = range(len(logits_array))
+            colors[max_idx] = "red"
+
+        ax.bar(
+            range(len(logits_array)),
+            logits_array,
+            color=colors,
+            edgecolor="black",
+        )
         ax.set_title(f"{label} - {mutation}")
-        bars = ax.bar(x_pos, logits_array, color=color_list, edgecolor="black")
-        ax.set_xticks(x_pos)
+        ax.set_xticks(range(len(logits_array)))
         ax.set_xticklabels(aa_labels, rotation=90)
         ax.set_ylabel("Logit")
-        for bar, value in zip(bars, logits_array):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                value,
-                f"{value:.2f}",
-                ha="center",
-                va="bottom",
-                fontsize=8,
-            )
+
+        # Add value labels
+        for i, value in enumerate(logits_array):
+            ax.text(i, value, f"{value:.2f}", ha="center", va="bottom", fontsize=8)
+
     fig.tight_layout()
     fig.savefig(output_dir / f"{sample}_{mutation}_logits_bar.png", dpi=300)
     plt.close(fig)
 
 
-def plot_heatmap(data, residues, title, output_path, cmap="coolwarm", vmin=None, vmax=None):
+def plot_heatmap(data, residues: list, title: str, output_path: Path):
+    """
+    Plot heatmap of logit differences.
+    """
     fig, ax = plt.subplots(figsize=(max(6, len(residues) * 0.6), 6))
-    im = ax.imshow(data, aspect="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+
+    im = ax.imshow(data, aspect="auto", cmap="coolwarm")
     ax.set_xticks(range(len(AA_LABELS)))
     ax.set_xticklabels(AA_LABELS, rotation=90)
     ax.set_yticks(range(len(residues)))
     ax.set_yticklabels(residues)
     ax.set_title(title)
+
     fig.colorbar(im, ax=ax, shrink=0.8)
     fig.tight_layout()
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
 
 
-def summarize_pocket(sample, residues, native_seq, target_logits, off_logits, output_dir):
+def create_pocket_summary(
+    sample: str,
+    pocket_pairs: list,
+    native_seq: list,
+    target_logits,
+    off_logits,
+    output_dir: Path,
+):
+    """
+    Create pocket analysis summary table.
+    """
     rows = []
-    for name, idx in residues:
+    for name, idx in pocket_pairs:
         native_idx = native_seq[idx]
         aa_native = restype_int_to_str.get(native_idx, "?")
         tgt = float(target_logits[idx, native_idx])
         off = float(off_logits[idx, native_idx])
+
         rows.append(
             {
                 "residue": name,
@@ -238,295 +315,211 @@ def summarize_pocket(sample, residues, native_seq, target_logits, off_logits, ou
                 "delta": tgt - off,
             }
         )
+
     df = pd.DataFrame(rows)
     df.sort_values(by="delta", ascending=False, inplace=True)
     df.to_csv(output_dir / f"{sample}_pocket_summary.csv", index=False)
     return df
 
 
-def compute_mutation_success(entries, site_idx, target_aa):
-    aa_to_idx = {aa: i for i, aa in enumerate(AA_LABELS)}
-    target_idx = aa_to_idx.get(target_aa.upper())
-    if target_idx is None:
-        raise ValueError(f"Unknown amino acid '{target_aa}'")
+def process_sample(
+    sample: str,
+    orig_entry: dict,
+    mod_entry: dict,
+    off_entry: dict,
+    pocket_indices: np.ndarray,
+    key_mutations: list,
+    output_dir: Path,
+    mod_raw_entries: list,
+):
+    """
+    Process a single sample for analysis.
+    """
+    sample_dir = output_dir / sample
+    sample_dir.mkdir(parents=True, exist_ok=True)
 
-    top1_match = 0
-    top3_match = 0
-    total = 0
-    top1_counts = Counter()
-
-    for entry in entries:
-        logits = torch.as_tensor(entry["logits"], dtype=torch.float32)
-        if logits.dim() != 3:
-            raise ValueError("Logits tensor must have shape [B, L, 21]")
-        if site_idx >= logits.shape[1]:
-            raise ValueError(f"Site index {site_idx} out of bounds for logits with length {logits.shape[1]}")
-        slice_logits = logits[:, site_idx, : len(AA_LABELS)]
-        for row in slice_logits:
-            total += 1
-            top1_idx = int(torch.argmax(row).item())
-            top1_aa = AA_LABELS[top1_idx]
-            top1_counts[top1_aa] += 1
-            if top1_idx == target_idx:
-                top1_match += 1
-            topk = torch.topk(row, k=min(3, row.numel()), dim=-1).indices.tolist()
-            if target_idx in topk:
-                top3_match += 1
-
-    top1_all_str = "; ".join([f"{aa}:{top1_counts.get(aa, 0)}" for aa in AA_LABELS])
-    return {
-        "top1_match": top1_match,
-        "top3_match": top3_match,
-        "total": total,
-        "top1_all_str": top1_all_str,
-        "top1_counter": top1_counts,
-    }
-
-
-def _pick_reference_entry(*entries):
-    for entry in entries:
-        if entry is None:
-            continue
-        residue_names = entry.get("residue_names")
-        logits = entry.get("logits")
-        if residue_names is None or logits is None:
-            continue
-        if len(residue_names) != logits.shape[0]:
-            continue
-        return entry
-    return None
-
-
-def plot_total_aggregate(label, entries, pocket_indices, key_mutations, output_dir):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    mod_entry = entries.get("mod_target")
-    orig_entry = entries.get("orig_target")
-    off_entry = entries.get("orig_off")
-
-    reference_entry = _pick_reference_entry(mod_entry, orig_entry, off_entry)
-    if reference_entry is None:
-        print("[Warning] Unable to determine residue names for aggregated plots; skipping total plots")
-        return
-
-    residue_names = reference_entry["residue_names"]
+    residue_names = mod_entry["residue_names"]
     pocket_pairs = [
         (residue_names[idx], idx)
         for idx in pocket_indices
         if idx < len(residue_names)
     ]
-    if not pocket_pairs:
-        print("[Warning] No pocket residues matched for aggregated plots; skipping total plots")
-        return
-    indices_order = [idx for _, idx in pocket_pairs]
-    residues_order = [name for name, _ in pocket_pairs]
 
+    if not pocket_pairs:
+        print(f"[Warning] No pocket residues for sample {sample}")
+        return []
+
+    success_rows = []
+
+    # Process key mutations
     for mutation in key_mutations:
         try:
             idx = parse_mutation_label(mutation, residue_names)
-        except ValueError as exc:
-            print(f"[Warning] {exc}; skipping mutation {mutation} for aggregated plot")
-            continue
-        datasets = {}
-        if orig_entry is not None:
-            datasets["Original target"] = orig_entry["logits"][idx, : len(AA_LABELS)].cpu().numpy()
-        if mod_entry is not None:
-            datasets["Modified target"] = mod_entry["logits"][idx, : len(AA_LABELS)].cpu().numpy()
-        if off_entry is not None:
-            datasets["Original off-target"] = off_entry["logits"][idx, : len(AA_LABELS)].cpu().numpy()
-        if not datasets:
-            continue
-        plot_key_site_bars(label, mutation, datasets, output_dir)
 
-    if mod_entry is not None and off_entry is not None:
-        delta_matrix = (
-            mod_entry["logits"][indices_order, : len(AA_LABELS)]
-            - off_entry["logits"][indices_order, : len(AA_LABELS)]
-        ).cpu().numpy()
-        plot_heatmap(
-            delta_matrix,
-            residues_order,
-            "Modified target - off-target logits (aggregated pocket)",
-            output_dir / f"{label}_delta_heatmap.png",
-        )
+            datasets = {
+                "Original target": orig_entry["logits"][idx, : len(AA_LABELS)]
+                .cpu()
+                .numpy(),
+                "Modified target": mod_entry["logits"][idx, : len(AA_LABELS)]
+                .cpu()
+                .numpy(),
+                "Original off-target": off_entry["logits"][idx, : len(AA_LABELS)]
+                .cpu()
+                .numpy(),
+            }
+            plot_mutation_bars(sample, mutation, datasets, sample_dir)
 
-    if mod_entry is not None and orig_entry is not None:
-        diff_mod_vs_orig = (
-            mod_entry["logits"][indices_order, : len(AA_LABELS)]
-            - orig_entry["logits"][indices_order, : len(AA_LABELS)]
-        ).cpu().numpy()
-        plot_heatmap(
-            diff_mod_vs_orig,
-            residues_order,
-            "Modified target - original target logits (aggregated pocket)",
-            output_dir / f"{label}_target_comparison_heatmap.png",
-        )
+            # Compute success rates
+            target_aa = extract_target_aa(mutation)
+            if target_aa and mod_raw_entries:
+                success = compute_mutation_success(mod_raw_entries, idx, target_aa)
+                success_rows.append(
+                    {
+                        "sample": sample,
+                        "mutation": mutation,
+                        "target_aa": target_aa,
+                        "top1_match": success["top1_match"],
+                        "top3_match": success["top3_match"],
+                        "total_ensembles": success["total"],
+                        "row_type": "sample",
+                    }
+                )
+
+        except ValueError as e:
+            print(f"[Warning] {e}; skipping {mutation} for {sample}")
+
+    # Create summary and heatmaps
+    create_pocket_summary(
+        sample,
+        pocket_pairs,
+        mod_entry["native_sequence"],
+        mod_entry["logits"],
+        off_entry["logits"],
+        sample_dir,
+    )
+
+    # Generate heatmaps
+    indices_order = [idx for _, idx in pocket_pairs]
+    residues_order = [name for name, _ in pocket_pairs]
+
+    # Target vs off-target difference
+    delta_matrix = (
+        mod_entry["logits"][indices_order, : len(AA_LABELS)]
+        - off_entry["logits"][indices_order, : len(AA_LABELS)]
+    ).cpu().numpy()
+    plot_heatmap(
+        delta_matrix,
+        residues_order,
+        "Modified target - off-target logits (pocket)",
+        sample_dir / f"{sample}_delta_heatmap.png",
+    )
+
+    # Modified vs original target
+    diff_matrix = (
+        mod_entry["logits"][indices_order, : len(AA_LABELS)]
+        - orig_entry["logits"][indices_order, : len(AA_LABELS)]
+    ).cpu().numpy()
+    plot_heatmap(
+        diff_matrix,
+        residues_order,
+        "Modified target - original target logits (pocket)",
+        sample_dir / f"{sample}_target_comparison_heatmap.png",
+    )
+
+    return success_rows
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare LigandMPNN original and modified results")
-    parser.add_argument("--orig_tar_scores", type=Path, required=True, help="Path to original scores directory")
-    parser.add_argument("--mod_tar_scores", type=Path, required=True, help="Path to modified target scores directory")
-    parser.add_argument("--orig_off_scores", type=Path, required=True, help="Path to original off-target scores directory")
-    parser.add_argument("--target_pdb", type=Path, required=True, help="Target PDB (with ligand) for pocket detection")
-    parser.add_argument("--output_dir", type=Path, required=True, help="Directory to store analysis outputs")
-    parser.add_argument("--key_mutations", nargs="*", default=[], help="Key mutation labels (e.g., T315I, A:T315I)")
-    parser.add_argument("--pocket_cutoff", type=float, default=5.0, help="Pocket cutoff distance in Angstroms")
+    parser = argparse.ArgumentParser(
+        description="Compare LigandMPNN specificity results"
+    )
+    parser.add_argument("--orig_tar_scores", type=Path, required=True)
+    parser.add_argument("--mod_tar_scores", type=Path, required=True)
+    parser.add_argument("--orig_off_scores", type=Path, required=True)
+    parser.add_argument("--target_pdb", type=Path, required=True)
+    parser.add_argument("--output_dir", type=Path, required=True)
+    parser.add_argument("--key_mutations", nargs="*", default=[])
+    parser.add_argument("--pocket_cutoff", type=float, default=5.0)
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load and process all score data
     orig_tar_raw = load_score_directory(args.orig_tar_scores)
-    mod_tar_row = load_score_directory(args.mod_tar_scores)
+    mod_tar_raw = load_score_directory(args.mod_tar_scores)
     orig_off_raw = load_score_directory(args.orig_off_scores)
 
-    orig = {k: average_entries(v) for k, v in orig_tar_raw.items()}
-    mod_target = {k: average_entries(v) for k, v in mod_tar_row.items()}
-    orig_off = {k: average_entries(v) for k, v in orig_off_raw.items()}
-    orig_total_entry = average_all_entries(orig_tar_raw)
-    mod_total_entry = average_all_entries(mod_tar_row)
-    orig_off_default = average_all_entries(orig_off_raw)
+    # Average entries
+    orig_averaged = {k: average_score_entries(v) for k, v in orig_tar_raw.items()}
+    mod_averaged = {k: average_score_entries(v) for k, v in mod_tar_raw.items()}
+    orig_off_averaged = {k: average_score_entries(v) for k, v in orig_off_raw.items()}
 
-    common_samples = sorted(set(orig) & set(mod_target))
+    # Get default off-target entry
+    default_off_entry = average_all_entries(orig_off_raw)
+
+    # Find common samples
+    common_samples = sorted(set(orig_averaged) & set(mod_averaged))
     if not common_samples:
-        raise RuntimeError("No common samples found between original and modified target score directories")
+        raise RuntimeError("No common samples found")
 
-    pocket_indices, pocket_names_from_pdb = compute_pocket_indices(args.target_pdb, args.pocket_cutoff)
-    if any(entry is not None for entry in (orig_total_entry, mod_total_entry, orig_off_default)):
-        aggregate_dir = ensure_output_dir(args.output_dir, "total")
-        total_entries = {
-            "orig_target": orig_total_entry,
-            "mod_target": mod_total_entry,
-            "orig_off": orig_off_default,
-        }
-        plot_total_aggregate("total", total_entries, pocket_indices, args.key_mutations, aggregate_dir)
+    # Compute pocket residues
+    pocket_indices, _ = compute_pocket_indices(args.target_pdb, args.pocket_cutoff)
+    print(f"Found {len(pocket_indices)} pocket residues")
 
-    success_rows = []
+    # Process each sample
+    all_success_rows = []
     success_totals = defaultdict(
         lambda: {"top1": 0, "top3": 0, "total": 0, "counter": Counter(), "target": None}
     )
 
     for sample in common_samples:
-        out_dir = ensure_output_dir(args.output_dir, sample)
-        orig_entry = orig[sample]
-        mod_tar_entry = mod_target[sample]
-        orig_off_entry = orig_off.get(sample)
-        if orig_off_entry is None:
-            if orig_off_default is None:
-                print(f"[Warning] No off-target scores available for sample {sample}; skipping")
-                continue
-            print(f"[Info] Using aggregated off-target logits for sample {sample}")
-            orig_off_entry = orig_off_default
-
-        residue_names = mod_tar_entry["residue_names"]
-        if len(residue_names) != mod_tar_entry["logits"].shape[0]:
-            raise RuntimeError("Residue name count mismatch with logits length")
-
-        pocket_pairs = [(residue_names[idx], idx) for idx in pocket_indices]
-        pocket_pairs = [pair for pair in pocket_pairs if pair[1] < len(residue_names)]
-        if not pocket_pairs:
-            print(f"[Warning] No pocket residues matched for sample {sample}; skipping pocket analysis")
+        off_entry = orig_off_averaged.get(sample, default_off_entry)
+        if off_entry is None:
+            print(f"[Warning] No off-target data for {sample}")
             continue
 
-        # Key mutation bar plots
-        for mutation in args.key_mutations:
-            try:
-                idx = parse_mutation_label(mutation, residue_names)
-            except ValueError as exc:
-                print(f"[Warning] {exc}; skipping mutation {mutation} for sample {sample}")
-                continue
-            datasets = {
-                "Original target": orig_entry["logits"][idx, : len(AA_LABELS)].cpu().numpy(),
-                "Modified target": mod_tar_entry["logits"][idx, : len(AA_LABELS)].cpu().numpy(),
-                "Original off-target": orig_off_entry["logits"][idx, : len(AA_LABELS)].cpu().numpy(),
-            }
-            plot_key_site_bars(sample, mutation, datasets, out_dir)
-
-            try:
-                target_aa = extract_mutation_target_aa(mutation)
-                if target_aa is not None:
-                    raw_entries = mod_tar_row.get(sample, [])
-                    success = compute_mutation_success(raw_entries, idx, target_aa)
-                    acc = success_totals[mutation]
-                    acc["top1"] += success["top1_match"]
-                    acc["top3"] += success["top3_match"]
-                    acc["total"] += success["total"]
-                    acc["counter"].update(success["top1_counter"])
-                    if acc["target"] is None:
-                        acc["target"] = target_aa
-                    success_rows.append(
-                        {
-                            "sample": sample,
-                            "mutation": mutation,
-                            "target_aa": target_aa,
-                            "top1_match": success["top1_match"],
-                            "top3_match": success["top3_match"],
-                            "total_ensembles": success["total"],
-                            "top1_counts": success["top1_all_str"],
-                            "row_type": "sample",
-                        }
-                    )
-            except Exception as exc:
-                print(f"[Warning] Failed to compute success for {sample} {mutation}: {exc}")
-
-        # Pocket summary table
-        summary_df = summarize_pocket(
+        success_rows = process_sample(
             sample,
-            pocket_pairs,
-            mod_tar_entry["native_sequence"],
-            mod_tar_entry["logits"],
-            orig_off_entry["logits"],
-            out_dir,
+            orig_averaged[sample],
+            mod_averaged[sample],
+            off_entry,
+            pocket_indices,
+            args.key_mutations,
+            args.output_dir,
+            mod_tar_raw.get(sample, []),
         )
 
-        residues_order = [name for name, _ in pocket_pairs]
-        indices_order = [idx for _, idx in pocket_pairs]
+        all_success_rows.extend(success_rows)
 
-        # Heatmap: target vs off-target logits difference (native AA)
-        delta_matrix = (
-            mod_tar_entry["logits"][indices_order, : len(AA_LABELS)]
-            - orig_off_entry["logits"][indices_order, : len(AA_LABELS)]
-        ).cpu().numpy()
-        plot_heatmap(
-            delta_matrix,
-            residues_order,
-            "Modified target - off-target logits (pocket)",
-            out_dir / f"{sample}_delta_heatmap.png",
-        )
+        # Accumulate totals
+        for row in success_rows:
+            mut = row["mutation"]
+            acc = success_totals[mut]
+            acc["top1"] += row["top1_match"]
+            acc["top3"] += row["top3_match"]
+            acc["total"] += row["total_ensembles"]
+            if acc["target"] is None:
+                acc["target"] = row["target_aa"]
 
-        # Heatmap: original vs modified target logits
-        diff_mod_vs_orig = (
-            mod_tar_entry["logits"][indices_order, : len(AA_LABELS)]
-            - orig_entry["logits"][indices_order, : len(AA_LABELS)]
-        ).cpu().numpy()
-        plot_heatmap(
-            diff_mod_vs_orig,
-            residues_order,
-            "Modified target - original target logits (pocket)",
-            out_dir / f"{sample}_target_comparison_heatmap.png",
-        )
+    # Save success summary
+    if all_success_rows:
+        summary_rows = [
+            {
+                "sample": "ALL",
+                "mutation": mut,
+                "target_aa": acc["target"] or "",
+                "top1_match": acc["top1"],
+                "top3_match": acc["top3"],
+                "total_ensembles": acc["total"],
+                "row_type": "total",
+            }
+            for mut, acc in sorted(success_totals.items())
+        ]
 
-        # Save summary as JSON for convenience
-        summary_path = out_dir / f"{sample}_pocket_summary.json"
-        summary_path.write_text(summary_df.to_json(orient="records", indent=2))
-
-    if success_rows:
-        summary_rows = []
-        for mut, acc in sorted(success_totals.items()):
-            top_counts_str = "; ".join([f"{aa}:{acc['counter'].get(aa, 0)}" for aa in AA_LABELS])
-            summary_rows.append(
-                {
-                    "sample": "ALL",
-                    "mutation": mut,
-                    "target_aa": acc["target"] or "",
-                    "top1_match": acc["top1"],
-                    "top3_match": acc["top3"],
-                    "total_ensembles": acc["total"],
-                    "top1_counts": top_counts_str,
-                    "row_type": "total",
-                }
-            )
-        success_df = pd.DataFrame(summary_rows + success_rows)
+        success_df = pd.DataFrame(summary_rows + all_success_rows)
         success_df.to_csv(args.output_dir / "mutation_success.csv", index=False)
+
+    print(f"Analysis complete. Results saved to {args.output_dir}")
 
 
 if __name__ == "__main__":
