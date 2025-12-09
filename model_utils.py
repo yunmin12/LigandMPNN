@@ -191,6 +191,7 @@ class ProteinMPNN(torch.nn.Module):
         B, L = S_true.shape
         device = S_true.device
 
+        # Extract off-target features
         off_target_feature_dicts = feature_dict.get("off_target_features") or []
         target_weight = float(feature_dict.get("target_weight", 1.0))
         off_target_weight = float(feature_dict.get("off_target_weight", 1.0))
@@ -199,13 +200,16 @@ class ProteinMPNN(torch.nn.Module):
             penalty_mask = penalty_mask.to(device=device, dtype=torch.float32)
         combine_off = len(off_target_feature_dicts) > 0 and abs(off_target_weight) > 0.0
 
+        # Encode target structures
         h_V, h_E, E_idx = self.encode(feature_dict)
+        # Encode off-target structures
         off_encodings = []
         if combine_off:
             for off_fd in off_target_feature_dicts:
                 off_h_V, off_h_E, off_E_idx = self.encode(off_fd)
                 off_encodings.append((off_fd, off_h_V, off_h_E, off_E_idx))
 
+        # Prepare context for decoding
         def _prepare_context(fd, h_V_base, h_E_base, E_idx_base, order_mask_backward_expanded):
             repeat_factor = B_decoder
             E_idx_ctx = E_idx_base.repeat(repeat_factor, 1, 1)
@@ -213,6 +217,7 @@ class ProteinMPNN(torch.nn.Module):
             chain_mask_ctx = (fd["mask"] * fd["chain_mask"]).repeat(repeat_factor, 1)
             bias_ctx = fd["bias"].repeat(repeat_factor, 1, 1)
 
+            # autoregressive masking
             mask_attend_ctx = torch.gather(
                 order_mask_backward_expanded, 2, E_idx_ctx
             ).unsqueeze(-1)
@@ -220,6 +225,7 @@ class ProteinMPNN(torch.nn.Module):
             mask_bw_ctx = mask_1D_ctx * mask_attend_ctx
             mask_fw_ctx = mask_1D_ctx * (1.0 - mask_attend_ctx)
 
+            # Initialize decoder hidden states
             h_V_ctx = h_V_base.repeat(repeat_factor, 1, 1)
             h_E_ctx = h_E_base.repeat(repeat_factor, 1, 1, 1)
             h_S_ctx = torch.zeros_like(h_V_ctx, device=device)
@@ -250,7 +256,9 @@ class ProteinMPNN(torch.nn.Module):
                 "S_true": fd["S"].repeat(repeat_factor, 1),
             }
 
+        # Stepwise decoding functions
         def _context_step_logits(ctx, positions):
+            # logits for given positions in the context
             positions_idx = positions.view(-1).long()
             E_idx_t = torch.gather(
                 ctx["E_idx"],
@@ -286,6 +294,7 @@ class ProteinMPNN(torch.nn.Module):
             )
             mask_t_ctx = torch.gather(ctx["mask"], 1, positions_idx[:, None])[:, 0]
 
+            # Decode step (hidden state update)
             for l, layer in enumerate(self.decoder_layers):
                 h_ESV_decoder_t = cat_neighbors_nodes(
                     ctx["h_V_stack"][l], h_ES_t, E_idx_t
@@ -306,6 +315,7 @@ class ProteinMPNN(torch.nn.Module):
                     layer(h_V_t, h_ESV_t, mask_V=mask_t_ctx),
                 )
 
+            # final output logits
             h_V_t = torch.gather(
                 ctx["h_V_stack"][-1],
                 1,
@@ -313,8 +323,9 @@ class ProteinMPNN(torch.nn.Module):
                     1, 1, ctx["h_V_stack"][-1].shape[-1]
                 ),
             )[:, 0]
-            return self.W_out(h_V_t)
+            return self.W_out(h_V_t)  # [B_decoder, 21]
 
+        # Update context with newly sampled amino acid
         def _update_context_sequence(ctx, positions, aa_embedding, aa_tokens):
             positions_idx = positions.view(-1).long()
             ctx["h_S"].scatter_(
@@ -385,29 +396,36 @@ class ProteinMPNN(torch.nn.Module):
                 (batch_dim, L, 21), device=device, dtype=torch.float32
             )
 
+            # Off-target combined sampling loop
             for t_idx in range(L):
+                # Get position indices for this step
                 pos_indices = decoding_order[:, t_idx].view(-1).long()
                 if pos_indices.shape[0] != batch_dim:
                     pos_indices = pos_indices.repeat(
                         batch_dim // pos_indices.shape[0]
                     )
 
+                # Get logits for target structure
                 logits_target = _context_step_logits(target_ctx, pos_indices)
                 if combine_off:
+                    # Get logits for off-target structures
                     off_logits_list = [
                         _context_step_logits(ctx, pos_indices)
                         for ctx in off_contexts
                     ]
+                    # Average off-target logits
                     mean_off_logits = torch.stack(
                         off_logits_list, dim=0
                     ).mean(dim=0)
                     mask_factor = torch.ones(
                         (batch_dim,), device=device, dtype=logits_target.dtype
                     )
+                    # Apply penalty mask if provided
                     if penalty_mask_expanded is not None:
                         mask_factor = torch.gather(
                             penalty_mask_expanded, 1, pos_indices[:, None]
                         )[:, 0]
+                    # ** Combine target and off-target logits **
                     logits_combined = (
                         target_weight * logits_target
                         - (mask_factor[:, None] * off_target_weight * mean_off_logits)
@@ -417,12 +435,14 @@ class ProteinMPNN(torch.nn.Module):
                 else:
                     logits_combined = logits_target
 
+                # Compute log probabilities
                 log_probs_combined = torch.nn.functional.log_softmax(
                     logits_combined, dim=-1
                 )
                 chain_mask_t = torch.gather(
                     target_ctx["chain_mask"], 1, pos_indices[:, None]
                 )[:, 0]
+                # Apply bias for this position
                 bias_t = torch.gather(
                     target_ctx["bias"],
                     1,
@@ -431,20 +451,24 @@ class ProteinMPNN(torch.nn.Module):
                     ),
                 )[:, 0, :]
 
+                # Compute probabilities with temperature scaling
                 probs = torch.nn.functional.softmax(
                     (logits_combined + bias_t) / temperature, dim=-1
                 )
+                # Sample amino acid from probabilities
                 probs_sample = probs[:, :20] / torch.sum(
                     probs[:, :20], dim=-1, keepdim=True
                 )
                 sampled_tokens = torch.multinomial(probs_sample, 1)[:, 0]
+                # Select tokens based on chain mask and true sequence
                 S_true_t = torch.gather(
                     target_ctx["S_true"], 1, pos_indices[:, None]
                 )[:, 0]
                 selected_tokens = (
-                    sampled_tokens * chain_mask_t
-                    + S_true_t * (1.0 - chain_mask_t)
+                    sampled_tokens * chain_mask_t  # redesigned positions: sampled tokens
+                    + S_true_t * (1.0 - chain_mask_t)  # fixed positions: true tokens
                 ).long()
+                # Compute amino acid embeddings
                 aa_embedding = self.W_s(selected_tokens)
 
                 all_probs.scatter_(
@@ -460,6 +484,7 @@ class ProteinMPNN(torch.nn.Module):
                     (chain_mask_t[:, None, None] * log_probs_combined[:, None, :]).float(),
                 )
 
+                # Update both target and off-target contexts with newly sampled amino acid sequences
                 _update_context_sequence(
                     target_ctx, pos_indices, aa_embedding, selected_tokens
                 )
