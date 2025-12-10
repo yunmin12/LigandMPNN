@@ -2,7 +2,7 @@
 Validate PDB IDs from BindingDB filtered data and select the best structure per protein.
 
 Steps:
-1. Protein validation (exact UniProt ID match)
+1. Protein validation (UniProt ID match via SIFTS)
 2. Ligand validation (HET ID match)
 3. Mutation check (wild-type)
 4. Best resolution
@@ -17,6 +17,15 @@ from pathlib import Path
 from datetime import datetime
 from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 import gzip
+
+# Solvent/common molecules to exclude
+SOLVENT_IDS = {
+    "HOH","WAT","DOD",  # water
+    "CL","NA","K","CA","MG","ZN","MN","CO","CU","NI","IOD",  # common ions
+    "SO4","PO4",  # anions
+    "GOL","EDO","PEG","PG4","MPD","TRS","MES","ACE","IPA","BME","FMT",  # common buffers/additives
+    "SEP", "TPO"    # modified residues
+}
 
 
 class PDBCache:
@@ -38,17 +47,72 @@ class PDBCache:
 
 class PDBValidator:
     """Validate and select best PDB structures."""
-    def __init__(self, cache_dir, verbose=True):
+    def __init__(self, cache_dir, assay_type, verbose=True):
         self.cache = PDBCache(cache_dir)
-        self.cif_dir = Path(cache_dir) / "cif"
-        self.pdb_dir = Path(cache_dir) / "pdb"
+        self.cif_dir = Path(cache_dir) / f"{assay_type}" / "cif"
+        self.pdb_dir = Path(cache_dir) / f"{assay_type}" / "pdb"
+        self.sifts_dir = Path(cache_dir) / "sifts"  # SIFTS cache
         self.cif_dir.mkdir(parents=True, exist_ok=True)
         self.pdb_dir.mkdir(parents=True, exist_ok=True)
+        self.sifts_dir.mkdir(parents=True, exist_ok=True)
         self.verbose = verbose
         
         # Statistics
         self.cache_hits = 0
         self.cache_misses = 0
+        
+        # Chem comp cache for InChI key lookups
+        self.chem_comp_cache = {}
+    
+    def _fetch_sifts_uniprot_mapping(self, pdb_id):
+        """
+        Fetch SIFTS UniProt mapping using PDBe REST API.
+        Returns list of UniProt accessions for this PDB entry.
+        """
+        pdb_id_lower = pdb_id.lower()
+        cache_file = self.sifts_dir / f"{pdb_id_lower}_sifts.json"
+        
+        # Check cache
+        if cache_file.exists():
+            return json.loads(cache_file.read_text())
+        
+        try:
+            url = f"https://www.ebi.ac.uk/pdbe/api/mappings/uniprot/{pdb_id_lower}"
+            response = requests.get(url, timeout=30)
+            
+            if response.status_code != 200:
+                if self.verbose:
+                    print(f"    SIFTS: No mapping available (HTTP {response.status_code})")
+                cache_file.write_text(json.dumps([]))
+                return []
+            
+            data = response.json()
+            
+            # Extract all UniProt accessions from the mapping
+            uniprot_ids = set()
+            
+            for pdb_entry_data in data.get(pdb_id_lower, {}).values():
+                # Each entry can have multiple UniProt mappings
+                for uniprot_data in pdb_entry_data.get('UniProt', {}).values():
+                    uniprot_acc = uniprot_data.get('identifier')
+                    if uniprot_acc:
+                        uniprot_ids.add(uniprot_acc)
+            
+            result = sorted(list(uniprot_ids))
+            
+            # Cache the result
+            cache_file.write_text(json.dumps(result, indent=2))
+            
+            if self.verbose and result:
+                print(f"    SIFTS: Found {len(result)} UniProt ID(s): {', '.join(result)}")
+            
+            return result
+            
+        except Exception as e:
+            if self.verbose:
+                print(f"    SIFTS: Error fetching mapping: {e}")
+            cache_file.write_text(json.dumps([]))
+            return []
     
     def fetch_metadata(self, pdb_id):
         """Fetch and cache PDB metadata."""
@@ -69,13 +133,27 @@ class PDBValidator:
             cif_path = self._download_cif(pdb_id)
             metadata = self._parse_cif(cif_path, pdb_id)
             
-            # Enrich with ligand data from PDBe
-            metadata['ligands'] = self._fetch_ligands_pdbe(pdb_id)
+            # Use SIFTS for UniProt mapping (primary method)
+            sifts_uniprots = self._fetch_sifts_uniprot_mapping(pdb_id)
+            
+            if sifts_uniprots:
+                # SIFTS is more reliable, use it as primary source
+                metadata['uniprot_ids'] = sifts_uniprots
+                metadata['uniprot_source'] = 'SIFTS'
+            else:
+                # Fallback to mmCIF if SIFTS unavailable
+                metadata['uniprot_source'] = 'mmCIF'
+                if not metadata['uniprot_ids']:
+                    if self.verbose:
+                        print(f"    ⚠️  No UniProt IDs found from SIFTS or mmCIF")
+            
+            # Fetch ligands using multiple methods
+            metadata['ligands'] = self._fetch_ligands_comprehensive(pdb_id)
             
             # Cache the result
             self.cache.save(pdb_id, metadata)
             
-            # Rate limiting (be polite to RCSB)
+            # Rate limiting (be polite to APIs)
             time.sleep(0.1)
             
             return metadata
@@ -123,7 +201,7 @@ class PDBValidator:
             "release_date": None
         }
         
-        # Extract UniProt IDs
+        # Extract UniProt IDs from mmCIF (fallback method)
         if "_struct_ref.db_name" in mmcif_dict:
             for i, db_name in enumerate(mmcif_dict["_struct_ref.db_name"]):
                 if db_name == "UNP":
@@ -165,33 +243,109 @@ class PDBValidator:
         
         return metadata
     
-    def _fetch_ligands_pdbe(self, pdb_id):
-        """Fetch ligand information from PDBe API."""
-        url = f"https://www.ebi.ac.uk/pdbe/api/pdb/compound/in_pdb/{pdb_id}"
+    def _rcsb_entry_summary(self, pdb_id, timeout=15):
+        """Fetch RCSB entry summary JSON."""
+        try:
+            url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
+            r = requests.get(url, timeout=timeout)
+            if r.status_code != 200:
+                return None
+            return r.json()
+        except Exception:
+            return None
+    
+    def _rcsb_polymer_entity_summary(self, pdb_id, timeout=15):
+        """Fetch RCSB polymer entity summary JSON."""
+        try:
+            url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id}/1"
+            r = requests.get(url, timeout=timeout)
+            if r.status_code != 200:
+                return None
+            return r.json()
+        except Exception:
+            return None
+    
+    def _rcsb_chem_comp(self, chem_id, timeout=15):
+        """Fetch RCSB chem_comp; cached."""
+        if chem_id in self.chem_comp_cache:
+            return self.chem_comp_cache[chem_id]
         
         try:
-            response = requests.get(url, timeout=10)
-            if response.status_code != 200:
-                return []
-            
-            data = response.json()
-            ligands = []
-            
-            for pdb_key, compounds in data.items():
-                for compound in compounds:
-                    ligands.append({
-                        "het_id": compound.get("chem_comp_id", ""),
-                        "name": compound.get("chem_comp_name", ""),
-                        "inchikey": compound.get("inchikey", ""),
-                        "smiles": compound.get("smiles", "")
-                    })
-            
-            return ligands
-            
-        except Exception as e:
-            if self.verbose:
-                print(f"  ⚠️  PDBe API error for {pdb_id}: {e}")
+            url = f"https://data.rcsb.org/rest/v1/core/chemcomp/{chem_id}"
+            r = requests.get(url, timeout=timeout)
+            if r.status_code != 200:
+                self.chem_comp_cache[chem_id] = None
+                return None
+            data = r.json()
+            self.chem_comp_cache[chem_id] = data
+            return data
+        except Exception:
+            self.chem_comp_cache[chem_id] = None
+            return None
+    
+    def _fetch_ligands_comprehensive(self, pdb_id):
+        """
+        Fetch ligands using multiple methods (similar to bindingdb_v2_2.py).
+        Tries multiple RCSB API endpoints to find ligand HET IDs.
+        """
+        entry_summary = self._rcsb_entry_summary(pdb_id)
+        polymer_entity_summary = self._rcsb_polymer_entity_summary(pdb_id)
+        
+        if not entry_summary and not polymer_entity_summary:
             return []
+        
+        comp_ids = set()
+        
+        # Method 1: rcsb_binding_affinity
+        if entry_summary and entry_summary.get('rcsb_binding_affinity') is not None:
+            comp_ids.update([c['comp_id'] for c in entry_summary.get('rcsb_binding_affinity', [])])
+        
+        # Method 2: nonpolymer_bound_components
+        if entry_summary and entry_summary.get("nonpolymer_bound_components") is not None:
+            comp_ids.update(entry_summary.get("nonpolymer_bound_components", []))
+        
+        # Method 3: entity_poly.rcsb_non_std_monomers
+        if polymer_entity_summary and polymer_entity_summary.get("entity_poly") is not None:
+            comp_ids.update(polymer_entity_summary.get("entity_poly", {}).get("rcsb_non_std_monomers", []))
+        
+        # Method 4: rcsb_polymer_entity_container_identifiers.chem_comp_nstd_monomers
+        if polymer_entity_summary and polymer_entity_summary.get("rcsb_polymer_entity_container_identifiers") is not None:
+            comp_ids.update(
+                polymer_entity_summary.get("rcsb_polymer_entity_container_identifiers", {})
+                .get("chem_comp_nstd_monomers", [])
+            )
+        
+        # Filter out solvents and get InChI keys
+        ligands = []
+        for cid in comp_ids:
+            if not cid or cid in SOLVENT_IDS or cid == "UNK":
+                continue
+            
+            # Fetch chem_comp details
+            cc = self._rcsb_chem_comp(cid)
+            inchikey = None
+            name = None
+            
+            if isinstance(cc, dict):
+                # Try rcsb_chem_comp_descriptor
+                inchikey = cc.get("rcsb_chem_comp_descriptor", {}).get("InChIKey")
+                name = cc.get("chem_comp", {}).get("name")
+                
+                # Fallback: pdbx_chem_comp_descriptor
+                if not inchikey:
+                    for d in (cc.get("pdbx_chem_comp_descriptor") or []):
+                        if (d.get("type") or "").lower() == "inchikey" and d.get("descriptor"):
+                            inchikey = d["descriptor"]
+                            break
+            
+            ligands.append({
+                "het_id": cid,
+                "name": name or "N/A",
+                "inchikey": inchikey or "N/A",
+                "smiles": "N/A"  # Not fetching SMILES for now
+            })
+        
+        return ligands
     
     def download_pdb_structure(self, pdb_id):
         """Download final PDB structure file."""
@@ -212,7 +366,7 @@ class PDBValidator:
             print(f"  ⚠️  Failed to download PDB {pdb_id}: {e}")
             return None
     
-    def validate_protein(self, row):
+    def validate_protein(self, row, idx, total):
         """Validate PDB IDs for a single protein row."""
         protein_key = row['protein_key']
         pdb_str = str(row.get('complex_pdb_id', '')).strip()
@@ -227,12 +381,13 @@ class PDBValidator:
             return None, "No valid PDB IDs"
         
         print(f"\n{'='*80}")
-        print(f"Protein: {protein_key}")
+        print(f"Protein: {protein_key} ({idx}/{total})")
         print(f"Original PDBs: {','.join(pdb_ids)}")
         
-        # STEP 1: Protein UniProt validation
-        print(f"\n[STEP 1: UniProt Validation]")
+        # STEP 1: Protein UniProt validation (using SIFTS)
+        print(f"\n[STEP 1: UniProt Validation via SIFTS]")
         expected_uniprot = str(row.get('uniprot_id', '')).strip()
+        print(f"  Expected UniProt: {expected_uniprot}")
         candidates_step1 = []
         
         for pdb_id in pdb_ids:
@@ -241,12 +396,15 @@ class PDBValidator:
                 print(f"  ✗ {pdb_id} - Failed to fetch metadata → DROPPED")
                 continue
             
-            if expected_uniprot in metadata['uniprot_ids']:
+            uniprot_ids = metadata.get('uniprot_ids', [])
+            source = metadata.get('uniprot_source', 'unknown')
+            
+            if expected_uniprot in uniprot_ids:
                 candidates_step1.append(pdb_id)
-                print(f"  ✓ {pdb_id} - UniProt match: {expected_uniprot}")
+                print(f"  ✓ {pdb_id} - UniProt match: {expected_uniprot} (source: {source})")
             else:
-                found = ', '.join(metadata['uniprot_ids']) if metadata['uniprot_ids'] else 'None'
-                print(f"  ✗ {pdb_id} - UniProt mismatch: found {found}, expected {expected_uniprot} → DROPPED")
+                found = ', '.join(uniprot_ids) if uniprot_ids else 'None'
+                print(f"  ✗ {pdb_id} - UniProt mismatch: found {found}, expected {expected_uniprot} (source: {source}) → DROPPED")
         
         print(f"  Remaining: {','.join(candidates_step1) if candidates_step1 else 'None'}")
         
@@ -310,8 +468,8 @@ class PDBValidator:
         if not candidates_step3:
             return None, "No wild-type structures"
         
-        # STEP 4: Best resolution + recent date
-        print(f"\n[STEP 4: Resolution & Date Ranking]")
+        # STEP 4: Best resolution
+        print(f"\n[STEP 4: Resolution Ranking]")
         
         if len(candidates_step3) == 1:
             best_pdb = candidates_step3[0]
@@ -358,17 +516,25 @@ def main():
         print(f"❌ Input file not found: {input_csv}")
         return
     
+    print(f"{'='*80}")
+    print(f"PDB VALIDATION STARTED")
+    print(f"{'='*80}")
+    print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Assay type: {args.assay_type}")
+    print(f"{'='*80}\n")
+    
     print(f"Loading {input_csv}...")
     df = pd.read_csv(input_csv)
-    print(f"Loaded {len(df)} rows")
+    total_rows = len(df)
+    print(f"Loaded {total_rows} rows\n")
     
     # Initialize validator
-    validator = PDBValidator(cache_dir, verbose=True)
+    validator = PDBValidator(cache_dir, assay_type=args.assay_type,verbose=True)
     
     # Validate each row
     results = []
     for idx, row in df.iterrows():
-        valid_pdb, reason = validator.validate_protein(row)
+        valid_pdb, reason = validator.validate_protein(row, idx + 1, total_rows)
         results.append({
             'protein_key': row['protein_key'],
             'original_pdbs': row.get('complex_pdb_id', ''),
@@ -379,20 +545,13 @@ def main():
     # Create summary DataFrame
     summary_df = pd.DataFrame(results)
     
-    # Add valid_pdb_id to original DataFrame
-    df['valid_pdb_id'] = summary_df['valid_pdb_id']
-    
-    # Save outputs
-    output_csv = out_dir / f"bindingdb_{args.assay_type}_valid.csv"
-    summary_csv = out_dir / f"pdb_validation_summary.csv"
-    
-    df.to_csv(output_csv, index=False)
+    # Save summary only
+    summary_csv = out_dir / f"pdb_validation_summary_{args.assay_type}.csv"
     summary_df.to_csv(summary_csv, index=False)
     
     print(f"\n{'='*80}")
     print(f"VALIDATION COMPLETE")
     print(f"{'='*80}")
-    print(f"✅ Saved validated data: {output_csv}")
     print(f"✅ Saved summary: {summary_csv}")
     print(f"\nCache statistics:")
     print(f"  Cache hits: {validator.cache_hits}")
@@ -402,8 +561,9 @@ def main():
     
     # Final statistics
     valid_count = (summary_df['valid_pdb_id'] != '').sum()
-    print(f"\n✅ Successfully validated: {valid_count}/{len(df)} entries")
+    print(f"\n✅ Successfully validated: {valid_count}/{total_rows} entries ({100*valid_count/total_rows:.1f}%)")
     print(f"   Downloaded PDB structures in: {cache_dir / 'pdb'}")
+    print(f"\nCompleted at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 if __name__ == "__main__":
