@@ -83,7 +83,7 @@ def main():
         description="Generate structure file lists from CSV based on entry_id ranges"
     )
     parser.add_argument(
-        "csv_file", 
+        "--csv_file", 
         help="Input CSV file (e.g., sair_pIC50_best_per_protein.csv)"
     )
     
