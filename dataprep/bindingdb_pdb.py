@@ -13,6 +13,7 @@ import requests
 import json
 import time
 import argparse
+import sys
 from pathlib import Path
 from datetime import datetime
 from Bio.PDB.MMCIF2Dict import MMCIF2Dict
@@ -26,6 +27,24 @@ SOLVENT_IDS = {
     "GOL","EDO","PEG","PG4","MPD","TRS","MES","ACE","IPA","BME","FMT",  # common buffers/additives
     "SEP", "TPO"    # modified residues
 }
+
+
+class TeeLogger:
+    """Logger that writes to both stdout and file."""
+    def __init__(self, log_file):
+        self.terminal = sys.stdout
+        self.log = open(log_file, 'w', encoding='utf-8', buffering=1)  # Line buffering
+    
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+    
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+    
+    def close(self):
+        self.log.close()
 
 
 class PDBCache:
@@ -49,8 +68,8 @@ class PDBValidator:
     """Validate and select best PDB structures."""
     def __init__(self, cache_dir, assay_type, verbose=True):
         self.cache = PDBCache(cache_dir)
-        self.cif_dir = Path(cache_dir) / f"{assay_type}" / "cif"
-        self.pdb_dir = Path(cache_dir) / f"{assay_type}" / "pdb"
+        self.cif_dir = Path(cache_dir) / "cif"
+        self.pdb_dir = Path(cache_dir) / f"{assay_type}_val_pdb"
         self.sifts_dir = Path(cache_dir) / "sifts"  # SIFTS cache
         self.cif_dir.mkdir(parents=True, exist_ok=True)
         self.pdb_dir.mkdir(parents=True, exist_ok=True)
@@ -510,60 +529,101 @@ def main():
     cache_dir = out_dir / "pdb_cache"
     
     # Input file
-    input_csv = out_dir / f"bindingdb_{args.assay_type}_best_per_protein_w_1210.csv"
+    input_csv = out_dir / "filtered" / f"bindingdb_{args.assay_type}_with_pdb_val.csv"
     
     if not input_csv.exists():
         print(f"❌ Input file not found: {input_csv}")
         return
     
-    print(f"{'='*80}")
-    print(f"PDB VALIDATION STARTED")
-    print(f"{'='*80}")
-    print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Assay type: {args.assay_type}")
-    print(f"{'='*80}\n")
+    # Setup logging
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = out_dir / "structures" / "log" / f"pdb_validation_{args.assay_type}_{timestamp}.log"
+    logger = TeeLogger(log_file)
+    sys.stdout = logger
     
-    print(f"Loading {input_csv}...")
-    df = pd.read_csv(input_csv)
-    total_rows = len(df)
-    print(f"Loaded {total_rows} rows\n")
-    
-    # Initialize validator
-    validator = PDBValidator(cache_dir, assay_type=args.assay_type,verbose=True)
-    
-    # Validate each row
-    results = []
-    for idx, row in df.iterrows():
-        valid_pdb, reason = validator.validate_protein(row, idx + 1, total_rows)
-        results.append({
-            'protein_key': row['protein_key'],
-            'original_pdbs': row.get('complex_pdb_id', ''),
-            'valid_pdb_id': valid_pdb if valid_pdb else '',
-            'validation_status': reason
-        })
-    
-    # Create summary DataFrame
-    summary_df = pd.DataFrame(results)
-    
-    # Save summary only
-    summary_csv = out_dir / f"pdb_validation_summary_{args.assay_type}.csv"
-    summary_df.to_csv(summary_csv, index=False)
-    
-    print(f"\n{'='*80}")
-    print(f"VALIDATION COMPLETE")
-    print(f"{'='*80}")
-    print(f"✅ Saved summary: {summary_csv}")
-    print(f"\nCache statistics:")
-    print(f"  Cache hits: {validator.cache_hits}")
-    print(f"  Cache misses: {validator.cache_misses}")
-    print(f"\nValidation summary:")
-    print(summary_df['validation_status'].value_counts())
-    
-    # Final statistics
-    valid_count = (summary_df['valid_pdb_id'] != '').sum()
-    print(f"\n✅ Successfully validated: {valid_count}/{total_rows} entries ({100*valid_count/total_rows:.1f}%)")
-    print(f"   Downloaded PDB structures in: {cache_dir / 'pdb'}")
-    print(f"\nCompleted at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    try:
+        print(f"{'='*80}")
+        print(f"PDB VALIDATION STARTED")
+        print(f"{'='*80}")
+        print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Assay type: {args.assay_type}")
+        print(f"Log file: {log_file}")
+        print(f"{'='*80}\n")
+        
+        print(f"Loading {input_csv}...")
+        df = pd.read_csv(input_csv)
+        total_rows = len(df)
+        print(f"Loaded {total_rows} rows\n")
+        
+        # Initialize validator
+        validator = PDBValidator(cache_dir, assay_type=args.assay_type, verbose=True)
+        
+        # Validate each row
+        results = []
+        for idx, row in df.iterrows():
+            try:
+                valid_pdb, reason = validator.validate_protein(row, idx + 1, total_rows)
+                results.append({
+                    'protein_key': row['protein_key'],
+                    'original_pdbs': row.get('complex_pdb_id', ''),
+                    'valid_pdb_id': valid_pdb if valid_pdb else '',
+                    'validation_status': reason
+                })
+                
+                # Save checkpoint every 50 proteins
+                if (idx + 1) % 50 == 0:
+                    checkpoint_df = pd.DataFrame(results)
+                    checkpoint_csv = out_dir / f"pdb_validation_checkpoint_{args.assay_type}_{timestamp}.csv"
+                    checkpoint_df.to_csv(checkpoint_csv, index=False)
+                    print(f"\n  💾 Checkpoint saved: {idx + 1}/{total_rows} proteins validated\n")
+                    
+            except Exception as e:
+                print(f"\n❌ ERROR processing protein {idx + 1}: {e}\n")
+                results.append({
+                    'protein_key': row.get('protein_key', 'UNKNOWN'),
+                    'original_pdbs': row.get('complex_pdb_id', ''),
+                    'valid_pdb_id': '',
+                    'validation_status': f'Error: {str(e)}'
+                })
+        
+        # Create summary DataFrame
+        summary_df = pd.DataFrame(results)
+        
+        # Merge results back to original DataFrame
+        df['valid_pdb_id'] = summary_df['valid_pdb_id']
+        df['validation_status'] = summary_df['validation_status']
+        output_csv = out_dir / "filtered" / f"bindingdb_{args.assay_type}_with_pdb_val_saved_pdb.csv"
+        df.to_csv(output_csv, index=False)
+
+        df_valid = df[df['valid_pdb_id'] != ''].copy()
+        output_valid_csv = out_dir / "filtered" / f"bindingdb_{args.assay_type}_with_pdb_val_valid_pdb.csv"
+        df_valid.to_csv(output_valid_csv, index=False)
+
+        # Save summary
+        summary_csv = out_dir / "structures" / "summary" / f"pdb_validation_summary_{args.assay_type}_{timestamp}.csv"
+        summary_df.to_csv(summary_csv, index=False)
+        
+        print(f"\n{'='*80}")
+        print(f"VALIDATION COMPLETE")
+        print(f"{'='*80}")
+        print(f"✅ Saved summary: {summary_csv}")
+        print(f"✅ Saved log: {log_file}")
+        print(f"\nCache statistics:")
+        print(f"  Cache hits: {validator.cache_hits}")
+        print(f"  Cache misses: {validator.cache_misses}")
+        print(f"\nValidation summary:")
+        print(summary_df['validation_status'].value_counts())
+        
+        # Final statistics
+        valid_count = (summary_df['valid_pdb_id'] != '').sum()
+        print(f"\n✅ Successfully validated: {valid_count}/{total_rows} entries ({100*valid_count/total_rows:.1f}%)")
+        print(f"   Downloaded PDB structures in: {cache_dir / f'{args.assay_type}_val_pdb'}")
+        print(f"\nCompleted at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+    finally:
+        # Always close logger
+        logger.close()
+        sys.stdout = logger.terminal
 
 
 if __name__ == "__main__":
