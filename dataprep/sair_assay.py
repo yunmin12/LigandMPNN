@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 # ---------- Configuration ----------
-INPUT_PARQUET = "/scratch/yunmin/data/db/graph/sair/sair.parquet"
+INPUT_PARQUET = "/scratch/yunmin/data/graph/sair/sair.parquet"
 
 def parse_args():
     p = argparse.ArgumentParser(description="SAIR pIC50-based curation")
