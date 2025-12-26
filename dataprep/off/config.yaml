@@ -1,0 +1,47 @@
+# Input files
+target_pdb: "target_complex.pdb"
+target_ligand_chain: "A"
+target_ligand_resid: "501"
+target_ligand_resname: "LIG"
+offtarget_ligand: "offtarget.sdf"  # SDF, MOL2, or PDB
+
+# Output directory
+output_dir: "/scratch/yunmin/data/graph/lmpnn/bdb_pdb/Kd/off_inputs"
+
+# Docking parameters
+docking:
+  n_seeds: 5
+  n_poses: 10  # per seed = 50 total
+  exhaustiveness: 32
+  box_padding: 5.0  # Angstrom padding around target ligand
+  cpu: 4
+  
+# Filtering parameters
+filtering:
+  vina_score_cutoff: -7.0  # kcal/mol
+  clash_distance: 2.0  # Angstrom
+  max_poses_to_relax: 20
+  
+# Relaxation parameters
+relaxation:
+  pocket_radius: 8.0  # Angstrom around ligand
+  nstruct: 1
+  
+# QC parameters
+qc:
+  rmsd_drift_cutoff: 2.0  # Angstrom
+  min_hbonds: 2
+  min_hydrophobic: 5
+  top_n_final: 10
+  energy_percentile: 0.25  # Take bottom 25% by energy
+  
+# Server paths
+paths:
+  vina: "vina"
+  rosetta_scripts: "/home/yunmin/src/Rosetta/main/source/bin/rosetta_scripts.default.linuxgccrelease"
+  rosetta_db: "/home/yunmin/src/Rosetta/main/database"
+  
+# SLURM settings
+slurm:
+  partition: "cpu"
+  mem: "16G"
