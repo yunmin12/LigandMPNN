@@ -20,6 +20,7 @@ Usage example:
 import os, sys
 import argparse
 from Bio.PDB import PDBParser, PDBIO, Select
+from Bio.PDB.Polypeptide import is_aa
 
 BACKBONE_ATOMS = {"N", "CA", "C", "O"}
 BACKBONE_PLUS_CB = {"N", "CA", "C", "O", "CB"}
@@ -41,8 +42,9 @@ class BackboneSelect(Select):
         hetflag = parent_res.id[0]  # " " (protein), "W" (water), "H_xxx" (ligand/ion)
         
         # discard alternative locations except blank or 'A'
-        if atom.get_altloc() not in (" ", "A"):
-            return 0
+        if is_aa(parent_res, standard=True): # only when protein residue
+            if atom.get_altloc() not in (" ", "A"):
+                return 0
         
         # protein residues
         if hetflag == " ":
