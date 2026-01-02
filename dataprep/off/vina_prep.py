@@ -44,9 +44,7 @@ class ProteinSelect(Select):
         if residue.resname in ['HOH', 'WAT']:
             return False
         # Exclude target ligand
-        if (self.exclude_chain and self.exclude_resid and
-            residue.parent.id == self.exclude_chain and
-            residue.id[1] == int(self.exclude_resid)):
+        if residue.id[0] != ' ':
             return False
         return True
 
@@ -121,6 +119,22 @@ def extract_ligand(pdb_file, chain_id, resid, output_pdb):
     logger.info(f"Extracted target ligand to {output_pdb}")
 
 
+def clean_pdb(input_pdb, output_pdb):
+    """
+    Clean PDB file: keep only ATOM records, remove HETATM
+    This helps with template matching in mk_prepare_receptor.py
+    """
+    atom_count = 0
+    with open(input_pdb, 'r') as f_in, open(output_pdb, 'w') as f_out:
+        for line in f_in:
+            if line.startswith('ATOM'):
+                f_out.write(line)
+                atom_count += 1
+    
+    logger.info(f"Cleaned PDB: {atom_count} ATOM records written to {output_pdb}")
+    return atom_count
+
+
 def prepare_receptor(pdb_file, chain_id, resid, output_pdb, output_pdbqt):
     """
     Prepare receptor: remove ligand and waters, save as PDB and PDBQT
@@ -131,40 +145,120 @@ def prepare_receptor(pdb_file, chain_id, resid, output_pdb, output_pdbqt):
     # Save receptor PDB (no ligand, no waters)
     io = PDBIO()
     io.set_structure(structure)
-    io.save(str(output_pdb), ProteinSelect(chain_id, resid))
+    temp_pdb = str(output_pdb).replace('.pdb', '_temp.pdb')
+    io.save(temp_pdb, ProteinSelect(chain_id, resid))
     
-    logger.info(f"Prepared receptor PDB: {output_pdb}")
+    # Clean PDB file (remove HETATM records that might cause issues)
+    atom_count = clean_pdb(temp_pdb, str(output_pdb))
+    
+    if atom_count == 0:
+        logger.error(f"Generated receptor PDB is empty!")
+        return None
+    
+    logger.info(f"Prepared receptor PDB: {output_pdb} ({atom_count} atoms)")
     
     # Convert to PDBQT using mk_prepare_receptor (meeko)
-    # Alternative: use obabel
+    # Important: mk_prepare_receptor adds .pdbqt extension automatically
+    output_base = str(output_pdbqt).replace('.pdbqt', '')
+    log_file = str(output_pdb).replace('.pdb', '_prep.log')
+    
+    # Try method 1: mk_prepare_receptor with default settings
+    logger.info("Attempting receptor preparation with mk_prepare_receptor.py...")
     cmd = [
         'mk_prepare_receptor.py',
         '-i', str(output_pdb),
-        '-o', str(output_pdbqt),
-        '-p', 
-        '--allow_bad_res'
+        '-o', output_base,
     ]
     
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
-        logger.info(f"Prepared receptor PDBQT: {output_pdbqt}")
-    except subprocess.CalledProcessError as e:
-        logger.error(
-            f"mk_prepare_receptor.py failed for {output_pdb}: "
-            f"{e.stderr.strip() if e.stderr else ''}"
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        
+        # Write full output to log file
+        with open(log_file, 'w') as f:
+            f.write("="*60 + "\n")
+            f.write("mk_prepare_receptor.py output\n")
+            f.write("="*60 + "\n")
+            f.write(f"Command: {' '.join(cmd)}\n\n")
+            f.write("STDOUT:\n")
+            f.write(result.stdout)
+            f.write("\n\nSTDERR:\n")
+            f.write(result.stderr)
+            f.write("\n\nReturn code: " + str(result.returncode) + "\n")
+        
+        logger.info(f"mk_prepare_receptor.py log saved to: {log_file}")
+        
+        # Check if pdbqt file was created
+        expected_pdbqt = output_base + '.pdbqt'
+        
+        if os.path.exists(expected_pdbqt):
+            file_size = os.path.getsize(expected_pdbqt)
+            logger.info(f"Generated PDBQT file size: {file_size} bytes")
+            
+            if file_size > 0:
+                # Rename to expected filename if different
+                if expected_pdbqt != str(output_pdbqt):
+                    os.rename(expected_pdbqt, str(output_pdbqt))
+                logger.info(f"✓ Prepared receptor PDBQT: {output_pdbqt}")
+                
+                # Show first few lines to verify content
+                with open(output_pdbqt, 'r') as f:
+                    first_lines = [f.readline() for _ in range(5)]
+                    logger.info(f"First lines of PDBQT:\n{''.join(first_lines)}")
+                
+                return output_pdbqt
+            else:
+                logger.error(f"PDBQT file is empty!")
+        else:
+            logger.error(f"PDBQT file not created at expected location: {expected_pdbqt}")
+        
+        # If we got here, mk_prepare_receptor failed
+        logger.warning("mk_prepare_receptor.py failed or produced empty file")
+        logger.warning("Check the log file for details: " + log_file)
+        
+        # Show stderr to user
+        if result.stderr:
+            logger.error("Error output from mk_prepare_receptor.py:")
+            for line in result.stderr.split('\n')[:20]:  # Show first 20 lines
+                if line.strip():
+                    logger.error(f"  {line}")
+        
+    except subprocess.TimeoutExpired:
+        logger.error("mk_prepare_receptor.py timed out")
         return None
-        # Fallback: use obabel
-        # logger.warning("mk_prepare_receptor.py failed, trying obabel...")
-        # cmd = [
-        #     'obabel',
-        #     str(output_pdb),
-        #     '-O', str(output_pdbqt),
-        #     '-xr'  # Rigid receptor
-        # ]
-        # subprocess.run(cmd, check=True)
-        # logger.info(f"Prepared receptor PDBQT with obabel: {output_pdbqt}")
-
+    except FileNotFoundError:
+        logger.error("mk_prepare_receptor.py not found. Is meeko installed?")
+        logger.info("Install with: pip install meeko")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return None
+    
+    # Fallback: Try obabel if mk_prepare_receptor failed
+    logger.warning("Attempting fallback method with obabel...")
+    try:
+        cmd = [
+            'obabel',
+            str(output_pdb),
+            '-O', str(output_pdbqt),
+            '-xr'  # Rigid receptor
+        ]
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        
+        if os.path.exists(output_pdbqt) and os.path.getsize(output_pdbqt) > 0:
+            logger.info(f"✓ Prepared receptor PDBQT with obabel: {output_pdbqt}")
+            return output_pdbqt
+        else:
+            logger.error("obabel also produced empty file")
+            return None
+            
+    except FileNotFoundError:
+        logger.error("obabel not found. Please install OpenBabel")
+        return None
+    except subprocess.CalledProcessError as e:
+        logger.error(f"obabel failed: {e}")
+        return None
+    
+    # return None
 
 def prepare_ligand(ligand_file, output_pdbqt):
     """
@@ -173,33 +267,46 @@ def prepare_ligand(ligand_file, output_pdbqt):
     """
     ligand_path = Path(ligand_file)
     
+    # mk_prepare_ligand adds .pdbqt extension automatically
+    output_base = str(output_pdbqt).replace('.pdbqt', '')
+    
     cmd = [
         'mk_prepare_ligand.py',
         '-i', str(ligand_path),
-        '-o', str(output_pdbqt)
+        '-o', output_base
     ]
 
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
-        logger.info(f"Prepared off-target ligand PDBQT: {output_pdbqt}")
-    except subprocess.CalledProcessError as e:
-        logger.error(
-            f"mk_prepare_ligand.py failed for {ligand_file}: "
-            f"{e.stderr.strip() if e.stderr else ''}"
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        expected_pdbqt = output_base + '.pdbqt'
+        
+        if os.path.exists(expected_pdbqt):
+            if expected_pdbqt != str(output_pdbqt):
+                os.rename(expected_pdbqt, str(output_pdbqt))
+            
+            if os.path.getsize(output_pdbqt) > 0:
+                logger.info(f"Prepared off-target ligand PDBQT: {output_pdbqt}")
+                return output_pdbqt
+            else:
+                logger.error("Generated ligand PDBQT is empty")
+        else:
+            logger.error(f"Ligand PDBQT not created")
+            
+        if result.stderr:
+            logger.error(f"mk_prepare_ligand.py errors: {result.stderr}")
+        
         return None
-        # Fallback: use obabel
-        # logger.warning("mk_prepare_ligand.py failed, trying obabel...")
-        # cmd = [
-        #     'obabel',
-        #     str(ligand_file),
-        #     '-O', str(output_pdbqt),
-        #     '--partialcharge', 'gasteiger',
-        #     '-p', '7.4',
-        #     '-h'
-        # ]
-        # subprocess.run(cmd, check=True, capture_output=True)
-        # logger.info(f"Prepared off-target ligand PDBQT: {output_pdbqt}")
+        
+    except subprocess.TimeoutExpired:
+        logger.error("mk_prepare_ligand.py timed out")
+        return None
+    except FileNotFoundError:
+        logger.error("mk_prepare_ligand.py not found. Is meeko installed?")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error preparing ligand: {e}")
+        return None
 
 
 def generate_vina_config(config, dirs, com, box_size, seed):
@@ -308,9 +415,9 @@ def main():
     # Prepare receptor
     logger.info("\n2. Preparing receptor...")
     receptor_pdb = dirs['prepared'] / 'receptor.pdb'
-    # if 'receptor.pdbqt', then by -o and -p options, the result pdbqt will be 'receptor.pdbqt.pdbqt'
     receptor_pdbqt = dirs['prepared'] / 'receptor.pdbqt'
-    prepare_receptor(
+    
+    result = prepare_receptor(
         config['target_pdb'],
         config['target_ligand_chain'],
         config['target_ligand_resid'],
@@ -318,10 +425,22 @@ def main():
         receptor_pdbqt
     )
     
+    if result is None:
+        logger.error("\n❌ Receptor preparation failed!")
+        logger.error("Please check:")
+        logger.error("  1. Is meeko or openbabel installed?")
+        logger.error("  2. Is the PDB file properly formatted?")
+        logger.error("  3. Check the log file in the prepared/ directory")
+        sys.exit(1)
+    
     # Prepare off-target ligand
     logger.info("\n3. Preparing off-target ligand...")
     offtarget_pdbqt = dirs['prepared'] / 'offtarget_ligand.pdbqt'
-    prepare_ligand(config['offtarget_ligand'], offtarget_pdbqt)
+    result = prepare_ligand(config['offtarget_ligand'], offtarget_pdbqt)
+    
+    if result is None:
+        logger.error("\n❌ Ligand preparation failed!")
+        sys.exit(1)
     
     # Generate Vina configs and SLURM scripts
     logger.info(f"\n4. Generating Vina configs and SLURM scripts for {config['docking']['n_seeds']} seeds...")
