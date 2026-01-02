@@ -18,6 +18,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 WATER_RESNAMES = {'HOH', 'WAT', 'H2O', 'DOD'}
+METAL_ION_RESNAMES = {
+    'NA','K','CL','CA','MG','ZN','FE','CU','MN','CO','NI',
+    'CD','HG','PB','SR','CS','BA','TI','V','CR','MO','SE','W','RB','YB','AL'
+}
 
 class LigandExtractor(Select):
     """Extract specific ligand and renumber to chain Z, resid 1"""
@@ -98,6 +102,13 @@ class TargetLigandExtractor:
             logger.error(f"Error parsing PDB: {e}")
             return None, None, None
     
+    def is_metal_ion(self, residue: Chain) -> bool:
+        atoms = list(residue.get_atoms())
+        if len(atoms) == 1:
+            return False
+        atom = atoms[0]
+        return atom.element.strip().upper() in METAL_ION_RESNAMES
+
     def extract_and_standardize(self, pdb_file: Path, chain_id: str, 
                                 resid: int, resname: str, pdb_id: str) -> Optional[Path]:
         """ 
@@ -155,10 +166,27 @@ class TargetLigandExtractor:
                 # 5) Remove all other HETATM/water residues
                 for chain in list(model):
                     for residue in list(chain):
-                        if not residue.id[0].startswith('H'):
+                        resname = residue.resname
+                        hetero_flag = residue.id[0]
+
+                        # retain target ligand only (now in Chain Z, ResID 1)
+                        if chain.id == 'Z' and residue.id[1] == 1:
                             continue
-                        if not (chain.id == 'Z' and residue.resname == resname and residue.id[1] == 1):
+                        
+                        # remove water molecules
+                        if resname in WATER_RESNAMES:
                             chain.detach_child(residue.id)
+                            continue
+                        
+                        # remove metal ions (by residue name)
+                        if resname in METAL_ION_RESNAMES:
+                            chain.detach_child(residue.id)
+                            continue
+                        
+                        # remove all other HETATM records (hetero_flag is not blank)
+                        if hetero_flag.strip():
+                            chain.detach_child(residue.id)
+                            continue
                 
                 ligand_found = True
                 break
@@ -281,7 +309,7 @@ class TargetLigandExtractor:
 if __name__ == "__main__":
     # CSV_PATH = "/scratch/yunmin/data/graph/lmpnn/bdb_pdb/Kd/off_inputs/ligand_sdf/bindingdb_with_ligand_paths.csv"
     CSV_PATH = "/scratch/yunmin/data/graph/lmpnn/bdb_pdb/off_inputs/counts/bindingdb_count_set3.csv"
-    OUTPUT_DIR = "/scratch/yunmin/data/graph/lmpnn/bdb_pdb/off_inputs/target_ligands"
+    OUTPUT_DIR = "/scratch/yunmin/data/graph/lmpnn/bdb_pdb/off_inputs/target_std"
     
     extractor = TargetLigandExtractor(OUTPUT_DIR, CSV_PATH)
     extractor.process_csv()
