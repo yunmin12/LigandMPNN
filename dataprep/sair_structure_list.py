@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# filepath: /home/yunmin/proj/LigandMPNN/dataprep/sair_structure_list.py
 """
 Generate structure file lists from SAIR CSV based on entry_id ranges.
 Creates text files with CIF file paths and maintains a TSV index of tarballs.
