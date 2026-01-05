@@ -670,7 +670,7 @@ def process_complex(base_dir, complex_id, config_num):
         
         # Calculate ligand RMSD between current seed and other seeds
         ligand_rmsd_current_seed = None
-        if len(seed_ligand_pdbs) > 1:
+        if len(seed_ligand_pdbs) > 0:
             rmsd_values = []
             for other_seed, other_ligand_pdb in seed_ligand_pdbs.items():
                 if other_seed != seed:
