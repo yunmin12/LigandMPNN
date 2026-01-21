@@ -3,6 +3,7 @@ target_pdb: "target_complex.pdb"
 target_ligand_chain: "A"
 target_ligand_resid: "501"
 target_ligand_resname: "LIG"
+off_target_ligand_resname: "OFF"
 offtarget_ligand: "offtarget.sdf"  # SDF, MOL2, or PDB
 
 # Output directory

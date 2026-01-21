@@ -40,6 +40,9 @@ class ConfigGenerator:
 
     def generate_config(self, row: pd.Series, complex_id: str, off_path: str, off_het: str) -> Dict[str, Any]:
         """Generate config dict for one complex"""
+        if not off_het or (isinstance(off_het, float) and pd.isna(off_het)):
+            raise ValueError(f"Invalid off_het value: {off_het}")
+        
         config = self.template.copy()
         
         # Target complex - ligand standardized to chain Z, resnum 1
@@ -47,6 +50,8 @@ class ConfigGenerator:
         config['target_ligand_chain'] = 'Z'  # Standardized
         config['target_ligand_resid'] = 1   # Standardized
         config['target_ligand_resname'] = str(row['ligand_het_id'])
+        config['off_target_ligand_resname'] = str(off_het)
+
         
         # Off-target ligand from our downloaded files
         config['offtarget_ligand'] = str(off_path)
@@ -206,17 +211,23 @@ class ConfigGenerator:
 
             key = (pk, het)
             off_path = self._offtarget_lookup.get(key)
-            if off_path:
+            if off_path and het:  # Ensure both off_path and het are valid
                 results.append((off_path, het))
 
         return results
     
 if __name__ == "__main__":
     # Paths
-    CSV_PATH = "/scratch/yunmin/data/graph/lmpnn/bdb_pdb/off_inputs/ligand_sdf/bindingdb_count_set3_with_ligand_paths_updated.csv"
+    # CSV_PATH = "/scratch/yunmin/data/graph/lmpnn/bdb_pdb/off_inputs/ligand_sdf/bindingdb_count_set3_with_ligand_paths_updated.csv"
     TEMPLATE_PATH = "/home/yunmin/proj/LigandMPNN/dataprep/off/config.yaml"
-    OUTPUT_CONFIGS_DIR = "/scratch/yunmin/data/graph/lmpnn/bdb_pdb/off_inputs/configs"
-    OUTPUT_RUNS_DIR = "/scratch/yunmin/data/graph/lmpnn/bdb_pdb/off_inputs/runs"
+    # OUTPUT_CONFIGS_DIR = "/scratch/yunmin/data/graph/lmpnn/bdb_pdb/off_inputs/configs"
+    # OUTPUT_RUNS_DIR = "/scratch/yunmin/data/graph/lmpnn/bdb_pdb/off_inputs/runs"
+
+    placeholder = "test"
+    CSV_PATH = f"/scratch/yunmin/data/graph/train/identity50/csvs/06_sample_example/{placeholder}_set_sampled_20targets_100offtargets.csv"
+    TEMPLATE_PATH = "/home/yunmin/proj/LigandMPNN/dataprep/train/config.yaml"
+    OUTPUT_CONFIGS_DIR = f"/scratch/yunmin/data/graph/train/example/{placeholder}/configs"
+    OUTPUT_RUNS_DIR = f"/scratch/yunmin/data/graph/train/example/{placeholder}/runs"
     
     generator = ConfigGenerator(
         csv_path=CSV_PATH,

@@ -265,8 +265,9 @@ class OffTargetLigandDownloader:
         logger.info(f"Overall success rate: {success_rate:.1f}%")
 
 if __name__ == "__main__":
-    CSV_PATH = f"/scratch/yunmin/data/graph/lmpnn/bdb_pdb/off_inputs/counts/bindingdb_count_set3.csv"
+    # CSV_PATH = f"/scratch/yunmin/data/graph/lmpnn/bdb_pdb/off_inputs/counts/bindingdb_count_set3.csv"
     OUTPUT_DIR = f"/scratch/yunmin/data/graph/lmpnn/bdb_pdb/off_inputs/ligand_sdf"
+    CSV_PATH = "/scratch/yunmin/data/graph/train/identity50/csvs/06_sample_example/train_set_sampled_20targets_100offtargets.csv"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     downloader = OffTargetLigandDownloader(OUTPUT_DIR, CSV_PATH)

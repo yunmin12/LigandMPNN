@@ -78,10 +78,20 @@ def pdbqt_to_pdb_lines(pdbqt_lines):
             pdb_lines.append(pdb_line)
     return pdb_lines
 
-def combine_receptor_ligand(receptor_pdb, ligand_pdb_lines, output_pdb):
+def _set_resname_and_chain(line, resname, chain_id):
+    resname = resname.ljust(3)[:3]
+    pdb_line = line[:17] + resname + line[20:21] + chain_id + line[22:]
+    return pdb_line
+
+def combine_receptor_ligand(receptor_pdb, ligand_pdb_lines, output_pdb, het_id=None, ligand_chain='Z'):
     """
     Combine receptor PDB file and ligand PDB lines into a single complex PDB.
-    Assigns the ligand chain 'Z' by default.
+    Inputs:
+        receptor_pdb: path to receptor PDB file
+        ligand_pdb_lines: list of strings (lines) for ligand PDB
+        output_pdb: path to save combined complex PDB
+        het_id: ligand HET ID
+        ligand_chain: Assigns the ligand chain 'Z' by default. Assigns the ligand chain 'X' for fastrelax.
     Returns: 
         True if successful, False otherwise
     """
@@ -97,12 +107,12 @@ def combine_receptor_ligand(receptor_pdb, ligand_pdb_lines, output_pdb):
             if not line.startswith(('END', 'ENDMDL'))
         ]
 
-        # Rewrite ligand chian ID to specified chain (default 'Z')
+        # Rewrite ligand chain ID to specified chain (default 'Z')
         ligand_with_chain = []
         for line in ligand_clean:
             if line.startswith(('ATOM', 'HETATM')):
-                # Change chain ID (column 22, index 21)
-                line = line[:21] + 'Z' + line[22:]
+                # Change resname (UNL -> HET ID) and chain ID
+                line = _set_resname_and_chain(line, het_id, ligand_chain)
             ligand_with_chain.append(line)
 
         with open(output_pdb, 'w') as f:
@@ -592,7 +602,7 @@ def process_complex(base_dir, complex_id, config_num):
 
         # Combine with receptor
         complex_pdb = filtered_dir / f'seed{seed}_complex.pdb'
-        save_success = combine_receptor_ligand(receptor_pdb, ligand_pdb_lines, complex_pdb)
+        save_success = combine_receptor_ligand(receptor_pdb, ligand_pdb_lines, complex_pdb, het_id, 'X')
         
         # Count receptor atoms
         num_receptor_atoms = 0
