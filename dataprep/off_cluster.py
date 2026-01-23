@@ -111,20 +111,21 @@ def assign_difficulty_bucket(group):
 
 
 def main():
-    output_dir = "/scratch/yunmin/data/graph/train/identity50/csvs"
-    representative_df_100plus = pd.read_csv(f"{output_dir}/representative_sequences_100plus_offtargets.csv")
+    set_type = "train"  # or "val", "test"
+    output_dir = "/scratch/yunmin/data/graph/train/identity50/csvs/07_similarity"
+    total_df = pd.read_csv(f"/scratch/yunmin/data/graph/train/identity50/csvs/06_sample_example/{set_type}_set_sampled_20targets_100offtargets.csv")
     print("Loaded representative sequences dataset")
 
     print("\n1️⃣ Computing molecular features and fingerprints...")
 
     # Load filtered dataset (>100 off-targets, >20 targets)
-    print(f"\nProcessing dataset: {len(representative_df_100plus):,} protein-ligand pairs")
+    print(f"\nProcessing dataset: {len(total_df):,} protein-ligand pairs")
 
     # Compute features for all ligands
     print("Computing molecular features for all ligands...")
     ligand_data = {}
 
-    unique_smiles = representative_df_100plus['ligand_smiles'].unique()
+    unique_smiles = total_df['ligand_smiles'].unique()
     print(f"  Total unique ligands: {len(unique_smiles):,}")
 
     for i, smiles in enumerate(unique_smiles):
@@ -138,8 +139,8 @@ def main():
     print(f"✅ Successfully processed {len(ligand_data):,}/{len(unique_smiles):,} ligands")
 
     # Add features to dataframe
-    representative_df_100plus['mol_valid'] = representative_df_100plus['ligand_smiles'].isin(ligand_data.keys())
-    print(f"  Valid molecules: {representative_df_100plus['mol_valid'].sum():,}")
+    total_df['mol_valid'] = total_df['ligand_smiles'].isin(ligand_data.keys())
+    print(f"  Valid molecules: {total_df['mol_valid'].sum():,}")
 
 
     # Process each protein-target pair
@@ -148,24 +149,24 @@ def main():
     protein_target_scores = []
 
     # Get unique proteins
-    unique_proteins_100plus = representative_df_100plus[
+    unique_proteins = total_df[
         ['uniprot_id', 'sequence', 'cluster_id']
     ].drop_duplicates()
 
-    print(f"Processing {len(unique_proteins_100plus):,} unique proteins...")
+    print(f"Processing {len(unique_proteins):,} unique proteins...")
 
-    for protein_idx, protein_row in tqdm(unique_proteins_100plus.iterrows(), 
-                                        total=len(unique_proteins_100plus),
+    for protein_idx, protein_row in tqdm(unique_proteins.iterrows(), 
+                                        total=len(unique_proteins),
                                         desc="Processing proteins"):
         uniprot_id = protein_row['uniprot_id']
         sequence = protein_row['sequence']
         cluster_id = protein_row['cluster_id']
         
         # Get all ligands for this protein
-        protein_df = representative_df_100plus[
-            (representative_df_100plus['uniprot_id'] == uniprot_id) &
-            (representative_df_100plus['sequence'] == sequence) &
-            (representative_df_100plus['mol_valid'] == True)
+        protein_df = total_df[
+            (total_df['uniprot_id'] == uniprot_id) &
+            (total_df['sequence'] == sequence) &
+            (total_df['mol_valid'] == True)
         ].copy()
         
         # Get target and off-target ligands
@@ -222,8 +223,8 @@ def main():
                     'uniprot_id': uniprot_id,
                     'sequence': sequence,
                     'cluster_id': cluster_id,
-                    'target_smiles': target_smiles,
-                    'off_target_smiles': off_smiles,
+                    'target_smiles': target_smiles,  # not 'ligand_smiles', but 'target_smiles'
+                    'off_target_smiles': off_smiles,  # not 'ligand_smiles', but 'off_target_smiles'
                     'similarity_2d': sim_2d,
                     'similarity_scaffold': sim_scaffold,
                     'similarity_physchem': sim_physchem,
@@ -240,8 +241,8 @@ def main():
     print(f"   Unique targets: {similarity_df['target_smiles'].nunique():,}")
     print(f"   Unique off-targets: {similarity_df['off_target_smiles'].nunique():,}")
 
-    similarity_df.to_csv(f"{output_dir}/protein_target_offtarget_similarities_100plus.csv", index=False)
-    print(f"\n💾 Saved similarity scores to 'protein_target_offtarget_similarities_100plus.csv'")
+    similarity_df.to_csv(f"{output_dir}/{set_type}_set_sampled_20targets_100offtargets_similarity.csv", index=False)
+    print(f"\n💾 Saved similarity scores to '{set_type}_set_sampled_20targets_100offtargets_similarity.csv'")
 
 
     print("\n3️⃣ Assigning difficulty buckets...")
@@ -273,42 +274,80 @@ def main():
 
 
     print("\n4️⃣ Merging with original dataset...")
-
-    # Merge similarity scores back to representative_df_100plus
-    representative_df_100plus_bucketed = representative_df_100plus.merge(
-        similarity_df_bucketed[['uniprot_id', 'sequence', 'ligand_smiles', 
+    # Merge similarity scores back to total_df
+    total_df_copy = total_df.copy()
+    total_df_copy = total_df_copy.rename(columns={'ligand_smiles': 'off_target_smiles'})
+    total_df_bucketed = total_df_copy.merge(
+        similarity_df_bucketed[['uniprot_id', 'sequence', 'target_smiles', 'off_target_smiles', 
                                 'similarity_2d', 'similarity_scaffold', 
                                 'similarity_physchem', 'similarity_composite', 
                                 'difficulty_bucket']],
-        on=['uniprot_id', 'sequence', 'ligand_smiles'],
+        on=['uniprot_id', 'sequence', 'off_target_smiles'],
         how='left'
     )
 
-    # Fill NaN for targets (no bucket assignment)
-    representative_df_100plus_bucketed['difficulty_bucket'] = (
-        representative_df_100plus_bucketed['difficulty_bucket']
+    reorder_col = [
+        # protein and sequence information
+        'protein_key', 'uniprot_id', 'target_name', 'target_source', 'sequence', 'sequence_length', 'cluster_id', 
+        # ligand information
+        'ligand_inchikey', 'target_type', 'target_smiles', 'off_target_smiles', 'ligand_name', 'ligand_het_id', 
+        # experimental data (pdb structure and assay)
+        'complex_pdb_id', 'valid_pdb_id', 'validation_status', 
+        'representative_assay_nM', 'assay_type', 'original_assay_nM', 
+        'curation_source', 'doi', 'data_source', 
+        # similarity and bucket assignment
+        'similarity_2d', 'similarity_scaffold', 'similarity_physchem', 'similarity_composite', 'difficulty_bucket',
+        # molecular features used to similarity calculation
+        'MW', 'cLogP', 'TPSA', 'HBD', 'HBA', 'RotBonds', 'Charge', 'NumRings', 'NumAromaticRings', 'scaffold', 'mol_valid', 
+        # SAIR columns
+        'entry_id (SAIR)', 'index (SAIR)', 'pIC50 (SAIR)', 'family (SAIR)', 'description (SAIR)', 
+        'vina_score_min (SAIR)', 'number_clashes (SAIR)', 'internal_energy (SAIR)', 
+        'confidence_score (SAIR)', 'complex_plddt (SAIR)', 'complex_iplddt (SAIR)', 'ptm (SAIR)', 'iptm (SAIR)', 
+        ]
+    total_df_bucketed = total_df_bucketed[reorder_col]
+
+    # Fill NaN for targets in off_target_smiles
+    mask_target = total_df_bucketed["target_type"] == "target"
+    total_df_bucketed.loc[mask_target, "off_target_smiles"] = pd.NA
+
+    # Fill missing target_smiles from target_smiles of off-target entries
+    keys = ["uniprot_id", "sequence", "cluster_id"]
+    df = total_df_bucketed
+    off_target_src = (
+        df["target_smiles"]
+        .where(df["target_type"].eq("off_target"))
+        .groupby([df[k] for k in keys])
+        .transform("first")
+    )
+    mask_fill = df["target_type"].eq("target") & df["target_smiles"].isna()
+    df.loc[mask_fill, "target_smiles"] = off_target_src[mask_fill]
+    total_df_bucketed = df
+
+    # Assign "target" to the difficulty_bucket for target entries
+    total_df_bucketed['difficulty_bucket'] = (
+        total_df_bucketed['difficulty_bucket']
         .fillna('target')
     )
 
     print(f"✅ Merged similarity data")
-    print(f"  Total rows: {len(representative_df_100plus_bucketed):,}")
-    print(f"  Rows with bucket: {(representative_df_100plus_bucketed['difficulty_bucket'] != 'target').sum():,}")
+    print(f"  Total rows: {len(total_df_bucketed):,}")
+    print(f"  Rows with bucket: {(total_df_bucketed['difficulty_bucket'] != 'target').sum():,}")
 
     print("\n5️⃣ Saving results...")
 
     # Save bucketed dataset
-    representative_df_100plus_bucketed.to_csv(
-        f"{output_dir}/representative_sequences_100plus_bucketed.csv",
+    total_df_bucketed.to_csv(
+        f"{output_dir}/{set_type}_set_sampled_20targets_100offtargets_bucketed.csv",
         index=False
     )
-    print(f"✅ Saved: {output_dir}/representative_sequences_100plus_bucketed.csv")
+    print(f"✅ Saved: {output_dir}/{set_type}_set_sampled_20targets_100offtargets_bucketed.csv")
 
     # Save similarity statistics
     similarity_df_bucketed.to_csv(
-        f"{output_dir}/ligand_similarity_scores.csv",
+        f"{output_dir}/{set_type}_set_sampled_20targets_100offtargets_similarity_stat.csv",
         index=False
     )
-    print(f"✅ Saved: {output_dir}/ligand_similarity_scores.csv")
+    print(f"✅ Saved: {output_dir}/{set_type}_set_sampled_20targets_100offtargets_similarity_stat.csv")
 
 if __name__ == "__main__":
     main()
