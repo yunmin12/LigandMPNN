@@ -8,12 +8,13 @@ import os
 import sys
 import logging
 from pathlib import Path
-from Bio.PDB import PDBParser, PDBIO, Select, Structure, Model, Chain
+from Bio.PDB import PDBParser, PDBIO, Select, Structure, Model, Chain, Atom
 from Bio.PDB.Polypeptide import is_aa
 import requests
 import pandas as pd
 from typing import Optional, Tuple
 from collections import Counter
+import numpy as np
 
 from urllib3 import Retry
 from utils.status_tracker import StatusTracker
@@ -50,7 +51,7 @@ BACKBONE_ATOMS = {"N", "CA", "C", "O"}
 
 
 class BackboneOnlySelect(Select):
-    """Select backbone atoms only, convert residues to ALA, keep HETATM"""
+    """Select backbone atoms + CB, keep HETATM"""
     def __init__(self):
         self.n_protein_atoms_kept = 0
         self.n_protein_atoms_removed = 0
@@ -60,13 +61,11 @@ class BackboneOnlySelect(Select):
         parent_res = atom.get_parent()
         hetflag = parent_res.id[0]
         
-        # Protein residues - keep only backbone
+        # Protein residues - keep backbone + CB
         if hetflag == " ":
             if is_aa(parent_res, standard=True):
-                # Change residue name to ALA
-                parent_res.resname = "ALA"
-                
-                if atom.name in BACKBONE_ATOMS:
+                # Keep backbone + CB for Alanine
+                if atom.name in BACKBONE_ATOMS or atom.name == "CB":
                     self.n_protein_atoms_kept += 1
                     return True
                 else:
@@ -120,7 +119,7 @@ class TargetPreparator:
             return True
         if head.startswith(b"DATA_"):
             return True
-        return True  # 너무 빡세게 막지 않기 위해 완화
+        return True
 
     def _download_to_file(
         self,
@@ -129,10 +128,6 @@ class TargetPreparator:
         out_path: Path,
         timeout: Tuple[float, float] = (10.0, 60.0),
     ) -> bool:
-        """
-        스트리밍으로 저장.
-        .gz면 풀어서 저장.
-        """
         with session.get(url, stream=True, timeout=timeout) as r:
             if r.status_code != 200:
                 return False
@@ -415,16 +410,92 @@ class TargetPreparator:
             logger.error(traceback.format_exc())
             return False
     
+    def _create_virtual_cb(self, residue) -> Optional[Atom.Atom]:
+        """Create virtual CB atom for residues that don't have one (e.g., GLY)"""
+        try:
+            # Need N, CA, C to calculate CB position
+            if not (residue.has_id('N') and residue.has_id('CA') and residue.has_id('C')):
+                return None
+            
+            # Get coordinates as numpy arrays
+            n_coord = residue['N'].get_coord()
+            ca_coord = residue['CA'].get_coord()
+            c_coord = residue['C'].get_coord()
+            
+            # Calculate vectors
+            # b: CA -> N direction
+            b = n_coord - ca_coord
+            # c_dir: CA -> C direction
+            c_dir = c_coord - ca_coord
+            
+            # Normalize vectors
+            b = b / np.linalg.norm(b)
+            c_dir = c_dir / np.linalg.norm(c_dir)
+            
+            # CB position: tetrahedral geometry
+            # Approximate method: CB is ~109.5° from both CA-N and CA-C
+            # Use cross product to get perpendicular direction
+            cross = np.cross(c_dir, b)
+            cross = cross / np.linalg.norm(cross)
+            
+            # CB direction: combination of -b (away from N) and cross product
+            # This creates approximate tetrahedral geometry
+            cb_direction = -b + cross
+            cb_direction = cb_direction / np.linalg.norm(cb_direction)
+            
+            # CB is ~1.54 Å from CA (standard C-C bond length)
+            cb_coord = ca_coord + cb_direction * 1.54
+            
+            # Create CB atom
+            cb_atom = Atom.Atom(
+                name='CB',
+                coord=cb_coord,
+                bfactor=20.0,
+                occupancy=1.0,
+                altloc=' ',
+                fullname=' CB ',
+                serial_number=0,
+                element='C'
+            )
+            
+            return cb_atom
+            
+        except Exception as e:
+            logger.warning(f"Failed to create virtual CB for {residue.get_parent().id}:{residue.id[1]}: {e}")
+            return None
+    
     def apply_sequence_blurring(self, input_pdb: Path, output_pdb: Path) -> bool:
-        """Apply sequence blurring using BackboneOnlySelect"""
+        """Apply sequence blurring: convert all residues to ALA, keep backbone + CB"""
         try:
             structure = self.parser.get_structure('input', input_pdb)
             
+            # First pass: Change all protein residues to ALA and add virtual CB if missing
+            n_virtual_cb_added = 0
+            for model in structure:
+                for chain in model:
+                    for residue in list(chain):
+                        hetflag = residue.id[0]
+                        # Only modify standard protein residues
+                        if hetflag == " " and is_aa(residue, standard=True):
+                            # Change to ALA
+                            residue.resname = "ALA"
+                            
+                            # Add virtual CB if missing (e.g., GLY)
+                            if not residue.has_id('CB'):
+                                virtual_cb = self._create_virtual_cb(residue)
+                                if virtual_cb:
+                                    residue.add(virtual_cb)
+                                    n_virtual_cb_added += 1
+                                    logger.debug(f"Added virtual CB to {chain.id}:{residue.id[1]}")
+            
+            # Second pass: Save with selector (keeps backbone + CB, removes side-chains)
             selector = BackboneOnlySelect()
             self.io.set_structure(structure)
             self.io.save(str(output_pdb), selector)
             
             logger.info(f"Sequence blurring completed: {output_pdb}")
+            logger.info(f"  Residues → ALA conversion")
+            logger.info(f"  Virtual CB atoms added: {n_virtual_cb_added}")
             logger.info(f"  Protein atoms kept: {selector.n_protein_atoms_kept}")
             logger.info(f"  Protein atoms removed: {selector.n_protein_atoms_removed}")
             logger.info(f"  HETATM atoms kept: {selector.n_hetero_atoms_kept}")
