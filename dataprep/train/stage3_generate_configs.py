@@ -203,7 +203,7 @@ class ConfigGenerator:
                         'target_blurred_path': target_data.get('target_blurred_path'),
                         'offtarget_complex_id': offtarget_data.get('complex_id'),
                         # 'offtarget_het_id': offtarget_data.get('ligand_het_id'),
-                        'ligand_path': offtarget_data.get('ligand_path'),
+                        'offtarget_ligand_path': offtarget_data.get('ligand_path'),
                         'config_file': str(self.output_configs_dir / f"{config_id}.yaml"),
                     })
         
