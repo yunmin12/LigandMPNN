@@ -168,7 +168,7 @@ class TrainingPipeline:
         
         return True
     
-    def run_stage4(self):
+    def run_stage4(self, use_gpu: bool = False):
         """Stage 4: Vina preparation"""
         logger.info("=" * 60)
         logger.info("STAGE 4: Vina Preparation")
@@ -176,11 +176,14 @@ class TrainingPipeline:
         
         cmd = [
             sys.executable,
-            str(Path(__file__).parent / 'stage4_vina_prep.py'),
+            str(Path(__file__).parent / 'stage4_vina_prep_gpu.py'),
             '--csv', str(self.stage_csvs[3]),
             '--runs_dir', str(self.dirs['runs']),
             '--status_dir', str(self.dirs['status']),
         ]
+        
+        if use_gpu:
+            cmd.append('--use_gpu')
         
         import subprocess
         process = subprocess.Popen(
@@ -203,20 +206,22 @@ class TrainingPipeline:
         
         return True
     
-    def run_stage5(self):
-        """Stage 5: Vina docking"""
+    def run_stage5(self, use_gpu: bool = False):
+        """Stage 5: Vina docking (GPU accelerated)"""
         logger.info("=" * 60)
-        logger.info("STAGE 5: Vina Docking")
+        logger.info("STAGE 5: Vina Docking (GPU accelerated)")
         logger.info("=" * 60)
         
         cmd = [
             sys.executable,
-            str(Path(__file__).parent / 'stage5_vina_dock.py'),
+            str(Path(__file__).parent / 'stage5_vina_dock_gpu.py'),
             '--csv', str(self.stage_csvs[4]),
             '--runs_dir', str(self.dirs['runs']),
             '--status_dir', str(self.dirs['status']),
-            '--n_seeds', '3',
         ]
+        
+        if use_gpu:
+            cmd.append('--use_gpu')
         
         import subprocess
         process = subprocess.Popen(
@@ -341,21 +346,22 @@ class TrainingPipeline:
         
         return progress_df
     
-    def run(self, start_stage: int = 1, end_stage: int = 6):
+    def run(self, start_stage: int = 1, end_stage: int = 6, use_gpu: bool = False):
         """Run pipeline from start_stage to end_stage"""
         logger.info("=" * 60)
         logger.info("Training Data Preparation Pipeline")
         logger.info(f"Base Directory: {self.base_dir}")
         logger.info(f"Input CSV: {self.csv_path}")
         logger.info(f"Stages: {start_stage} to {end_stage}")
+        logger.info(f"Use GPU: {use_gpu}")
         logger.info("=" * 60)
         
         stage_funcs = {
             1: self.run_stage1,
             2: self.run_stage2,
             3: self.run_stage3,
-            4: self.run_stage4,
-            5: self.run_stage5,
+            4: lambda: self.run_stage4(use_gpu=use_gpu),
+            5: lambda: self.run_stage5(use_gpu=use_gpu),
             6: self.run_stage6,
         }
         
@@ -379,8 +385,8 @@ def main():
         # Run all stages
         python pipeline.py --csv input.csv --base_dir /scratch/data/runs
         
-        # Run specific stages
-        python pipeline.py --csv input.csv --base_dir /scratch/data/runs --start 2 --end 3
+        # Run specific stages with GPU
+        python pipeline.py --csv input.csv --base_dir /scratch/data/runs --start 4 --end 5 --use_gpu
         
         # Generate progress report only
         python pipeline.py --csv input.csv --base_dir /scratch/data/runs --report-only
@@ -392,6 +398,7 @@ def main():
     parser.add_argument('--template', help='Config template YAML file (optional)')
     parser.add_argument('--start', type=int, default=1, help='Start stage (default: 1)')
     parser.add_argument('--end', type=int, default=6, help='End stage (default: 6)')
+    parser.add_argument('--use_gpu', action='store_true', help='Use GPU acceleration (Uni-Dock) for docking')
     parser.add_argument('--report-only', action='store_true', help='Only generate progress report')
     
     args = parser.parse_args()
@@ -407,7 +414,7 @@ def main():
     if args.report_only:
         pipeline.generate_progress_report()
     else:
-        pipeline.run(start_stage=args.start, end_stage=args.end)
+        pipeline.run(start_stage=args.start, end_stage=args.end, use_gpu=args.use_gpu)
 
 
 if __name__ == '__main__':
