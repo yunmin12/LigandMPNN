@@ -115,6 +115,7 @@ class VinaPreparator:
                 '-i', str(receptor_pdb),
                 '-o', output_base,
                 '--allow_bad_res',
+                '--default_altloc', 'A',
                 '-p', '-j'
             ]
             
