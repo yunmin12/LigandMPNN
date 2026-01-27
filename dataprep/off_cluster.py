@@ -1,3 +1,6 @@
+import argparse
+import os
+from posixpath import basename
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -111,10 +114,25 @@ def assign_difficulty_bucket(group):
 
 
 def main():
-    set_type = "train"  # or "val", "test"
-    output_dir = "/scratch/yunmin/data/graph/train/identity50/csvs/07_similarity"
-    total_df = pd.read_csv(f"/scratch/yunmin/data/graph/train/identity50/csvs/06_sample_example/{set_type}_set_sampled_20targets_100offtargets.csv")
+    p = argparse.ArgumentParser(
+        description='Compute ligand similarities and assign difficulty buckets'
+    )
+    p.add_argument(
+        '--set',
+        type=str,
+        required=True,
+        choices=['train', 'val', 'test', 'train_std', 'val_std', 'test_std'],
+        help='Dataset split (train/val/test/train_std/val_std/test_std)'
+    )
+    args = p.parse_args()
+    set_type = args.set
+    
+    output_dir = f"/scratch/yunmin/data/graph/train/example/{set_type}"
+    # csv_path = f"/scratch/yunmin/data/graph/train/identity50/csvs/06_sample_example/{set_type}_set_sampled_20targets_100offtargets.csv"
+    csv_path = f"/scratch/yunmin/data/graph/train/example/{set_type}/{set_type}_set_sampled_after_dataprep.csv"
+    total_df = pd.read_csv(csv_path)
     print("Loaded representative sequences dataset")
+    basename = os.path.splitext(os.path.basename(csv_path))[0]
 
     print("\n1️⃣ Computing molecular features and fingerprints...")
 
@@ -241,8 +259,8 @@ def main():
     print(f"   Unique targets: {similarity_df['target_smiles'].nunique():,}")
     print(f"   Unique off-targets: {similarity_df['off_target_smiles'].nunique():,}")
 
-    similarity_df.to_csv(f"{output_dir}/{set_type}_set_sampled_20targets_100offtargets_similarity.csv", index=False)
-    print(f"\n💾 Saved similarity scores to '{set_type}_set_sampled_20targets_100offtargets_similarity.csv'")
+    similarity_df.to_csv(f"{output_dir}/{basename}_similarity.csv", index=False)
+    print(f"\n💾 Saved similarity scores to '{basename}_similarity.csv'")
 
 
     print("\n3️⃣ Assigning difficulty buckets...")
@@ -286,22 +304,42 @@ def main():
         how='left'
     )
 
+    # reorder_col = [
+    #     # protein and sequence information
+    #     'protein_key', 'uniprot_id', 'target_name', 'target_source', 'sequence', 'sequence_length', 'cluster_id', 
+    #     # ligand information
+    #     'ligand_inchikey', 'target_type', 'target_smiles', 'off_target_smiles', 'ligand_name', 'ligand_het_id', 
+    #     # experimental data (pdb structure and assay)
+    #     'complex_pdb_id', 'valid_pdb_id', 'validation_status', 
+    #     'representative_assay_nM', 'assay_type', 'original_assay_nM', 
+    #     'curation_source', 'doi', 'data_source', 
+    #     # similarity and bucket assignment
+    #     'similarity_2d', 'similarity_scaffold', 'similarity_physchem', 'similarity_composite', 'difficulty_bucket',
+    #     # molecular features used to similarity calculation
+    #     'MW', 'cLogP', 'TPSA', 'HBD', 'HBA', 'RotBonds', 'Charge', 'NumRings', 'NumAromaticRings', 'scaffold', 'mol_valid', 
+    #     # SAIR columns
+    #     'entry_id (SAIR)', 'index (SAIR)', 'pIC50 (SAIR)', 'family (SAIR)', 'description (SAIR)', 
+    #     'vina_score_min (SAIR)', 'number_clashes (SAIR)', 'internal_energy (SAIR)', 
+    #     'confidence_score (SAIR)', 'complex_plddt (SAIR)', 'complex_iplddt (SAIR)', 'ptm (SAIR)', 'iptm (SAIR)', 
+    #     ]
     reorder_col = [
         # protein and sequence information
-        'protein_key', 'uniprot_id', 'target_name', 'target_source', 'sequence', 'sequence_length', 'cluster_id', 
+        'protein_key', 'uniprot_id', 'target_name', 'target_source', 'sequence', 'sequence_length', 
         # ligand information
-        'ligand_inchikey', 'target_type', 'target_smiles', 'off_target_smiles', 'ligand_name', 'ligand_het_id', 
+        'ligand_inchikey', 'target_type', 'target_smiles', 'off_target_smiles', 'ligand_name', 'ligand_het_id',  'difficulty_bucket',
+        # path information
+        'cluster_id', 'config_id', 'target_complex_id', 'target_blurred_path', 'offtarget_ligand_path', 'offtarget_pose_path', 'config_file',
         # experimental data (pdb structure and assay)
         'complex_pdb_id', 'valid_pdb_id', 'validation_status', 
         'representative_assay_nM', 'assay_type', 'original_assay_nM', 
         'curation_source', 'doi', 'data_source', 
         # similarity and bucket assignment
-        'similarity_2d', 'similarity_scaffold', 'similarity_physchem', 'similarity_composite', 'difficulty_bucket',
+        'similarity_2d', 'similarity_scaffold', 'similarity_physchem', 'similarity_composite',
         # molecular features used to similarity calculation
         'MW', 'cLogP', 'TPSA', 'HBD', 'HBA', 'RotBonds', 'Charge', 'NumRings', 'NumAromaticRings', 'scaffold', 'mol_valid', 
         # SAIR columns
-        'entry_id (SAIR)', 'index (SAIR)', 'pIC50 (SAIR)', 'family (SAIR)', 'description (SAIR)', 
-        'vina_score_min (SAIR)', 'number_clashes (SAIR)', 'internal_energy (SAIR)', 
+        'entry_id (SAIR)', 'index (SAIR)', 'pIC50 (SAIR)', 'family (SAIR)', 
+        'description (SAIR)', 'vina_score_min (SAIR)', 'number_clashes (SAIR)', 'internal_energy (SAIR)', 
         'confidence_score (SAIR)', 'complex_plddt (SAIR)', 'complex_iplddt (SAIR)', 'ptm (SAIR)', 'iptm (SAIR)', 
         ]
     total_df_bucketed = total_df_bucketed[reorder_col]
@@ -337,17 +375,17 @@ def main():
 
     # Save bucketed dataset
     total_df_bucketed.to_csv(
-        f"{output_dir}/{set_type}_set_sampled_20targets_100offtargets_bucketed.csv",
+        f"{output_dir}/{basename}_bucketed.csv",
         index=False
     )
-    print(f"✅ Saved: {output_dir}/{set_type}_set_sampled_20targets_100offtargets_bucketed.csv")
+    print(f"✅ Saved: {output_dir}/{basename}_bucketed.csv")
 
     # Save similarity statistics
     similarity_df_bucketed.to_csv(
-        f"{output_dir}/{set_type}_set_sampled_20targets_100offtargets_similarity_stat.csv",
+        f"{output_dir}/{basename}_similarity_stat.csv",
         index=False
     )
-    print(f"✅ Saved: {output_dir}/{set_type}_set_sampled_20targets_100offtargets_similarity_stat.csv")
+    print(f"✅ Saved: {output_dir}/{basename}_similarity_stat.csv")
 
 if __name__ == "__main__":
     main()
