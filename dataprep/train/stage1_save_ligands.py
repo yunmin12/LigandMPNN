@@ -162,9 +162,14 @@ class LigandSaver:
                 output_file.unlink()
             return None
     
-    def generate_from_smiles(self, smiles: str, het_id: str) -> Optional[Path]:
-        """Generate 3D structure from SMILES"""
-        output_file = self.from_smiles_dir / f"{het_id}_generated.sdf"
+    def generate_from_smiles(self, smiles: str, identifier: str) -> Optional[Path]:
+        """Generate 3D structure from SMILES
+        
+        Args:
+            smiles: SMILES string
+            identifier: Unique identifier (e.g., 'PDB_HET' or 'complex_id')
+        """
+        output_file = self.from_smiles_dir / f"{identifier}_generated.sdf"
         
         try:
             mol = Chem.MolFromSmiles(smiles)
@@ -193,7 +198,7 @@ class LigandSaver:
             return None
     
     def get_ligand(self, het_id: Optional[str] = None, pdb_id: Optional[str] = None, 
-                   smiles: Optional[str] = None) -> Tuple[Optional[str], str, list]:
+                   smiles: Optional[str] = None, complex_id: str = "unknown") -> Tuple[Optional[str], str, list]:
         """
         Get ligand file path with fallback priority
         Returns: (file_path, source, attempt_log)
@@ -203,6 +208,12 @@ class LigandSaver:
         2. Extract from PDB (if pdb_id available)
         3. Download from PubChem (if het_id available)
         4. Generate from SMILES (if smiles available)
+        
+        Args:
+            het_id: HET ID of the ligand
+            pdb_id: PDB ID to extract from
+            smiles: SMILES string
+            complex_id: Unique identifier for this complex (for file naming)
         """
         attempt_log = []
         
@@ -254,9 +265,19 @@ class LigandSaver:
         # Priority 4: Generate from SMILES
         if smiles:
             attempt_log.append(f"4. Attempting to generate from SMILES...")
-            ligand_file = self.generate_from_smiles(smiles, het_id or "generated")
+            # Create unique identifier for filename
+            if pdb_id and het_id:
+                identifier = f"{pdb_id}_{het_id}"
+            elif pdb_id:
+                identifier = f"{pdb_id}_LIG"
+            elif het_id:
+                identifier = het_id
+            else:
+                identifier = complex_id
+            
+            ligand_file = self.generate_from_smiles(smiles, identifier)
             if ligand_file:
-                attempt_log.append(f"   ✓ SUCCESS: Generated from SMILES")
+                attempt_log.append(f"   ✓ SUCCESS: Generated from SMILES as {identifier}_generated.sdf")
                 return str(ligand_file), 'smiles', attempt_log
             attempt_log.append(f"   ✗ Failed to generate from SMILES")
         else:
@@ -317,7 +338,7 @@ class LigandSaver:
             
             # Get ligand with priority order
             ligand_path, ligand_source, method_log = self.get_ligand(
-                het_id_valid, pdb_id_valid, smiles_valid
+                het_id_valid, pdb_id_valid, smiles_valid, complex_id
             )
             attempt_log.extend(method_log)
             
